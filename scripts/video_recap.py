@@ -30,10 +30,11 @@ CONFIG = {
     "tts_engine": "auto",  # auto | indextts2 | edge-tts | say
     "edge_tts_voice": "zh-CN-YunxiNeural",
     "style_voices": {
-        "纪录片": "zh-CN-YunxiNeural",
-        "轻松幽默": "zh-CN-YunxiNeural",
-        "专业分析": "zh-CN-YunjianNeural",
-        "儿童": "zh-CN-XiaoyiNeural",
+        "短剧": "zh-CN-YunxiNeural",
+        "电视剧": "zh-CN-XiaoxiaoNeural",
+        "电影": "zh-CN-YunjianNeural",
+        "纪录片": "zh-CN-YunyangNeural",
+        "科普视频": "zh-CN-XiaoyiNeural",
     },
     "say_voice": "Tingting",
     "fps": 0,  # 0 = 自动（≤60s→2fps, ≤5min→1.5fps, >5min→1fps）
@@ -2624,7 +2625,7 @@ def main():
     parser.add_argument("--step", choices=["extract", "detect", "asr", "analyze", "script", "tts", "assemble"],
                         help="仅执行某步骤")
     parser.add_argument("--style", default="纪录片",
-                        choices=["纪录片", "轻松幽默", "专业分析", "儿童"],
+                        choices=["短剧", "电视剧", "电影", "纪录片", "科普视频"],
                         help="解说风格 (默认: 纪录片)")
     parser.add_argument("--scene-threshold", type=float, default=0.1,
                         help="场景检测阈值 0.0-1.0 (默认: 0.1, 对应 scdet=10)")
