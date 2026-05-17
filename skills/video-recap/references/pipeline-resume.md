@@ -9,7 +9,8 @@ Pipeline 会在 `work_dir` 下用 `.step_*.done` 标记已完成阶段。
 | `.step_asr.done` | ASR |
 | `.step_silence.done` | 静音检测 |
 | `.step_vlm.done` | VLM 分析 |
-| `.step_script.done` | Agent 写好的 `narration.json` 已验证 |
+| `.step_script.done` | Agent 写好的 `narration.json` 已验证；cut 模式还要求 `clip_plan.json` |
+| `.step_edit.done` | cut 模式剪辑源视频与时间轴映射已生成 |
 | `.step_tts.done` | TTS 合成 |
 | `.step_assemble.done` | 视频组装 |
 
@@ -25,6 +26,13 @@ python3 scripts/video_recap.py <video> --resume work_dir
 rm -rf work_dir/tts_segments/ work_dir/.step_tts.done \
   work_dir/.step_assemble.done work_dir/tts_meta.json
 python3 scripts/video_recap.py <video> --resume work_dir
+```
+
+cut 模式下，如果只改了 `clip_plan.json` 或 `narration.json`，续跑会自动重建 `clip_plan_validated.json`、`edited_source.mp4`、`narration_mapped.json`。如果想强制重建，也可以删：
+
+```bash
+rm -f work_dir/.step_edit.done work_dir/clip_plan_validated.json \
+  work_dir/narration_mapped.json work_dir/edited_source.mp4
 ```
 
 ## 换音色

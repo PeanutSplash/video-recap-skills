@@ -53,11 +53,69 @@
 
 ## narration.json
 
-Agent 撰写的解说词（字段详见 `agent-mode-workflow.md`）：
+Agent 撰写的解说词（字段详见 `agent-mode-workflow.md`）。full 模式下使用原视频时间；cut 模式下也先使用原视频时间，CLI 会生成 `narration_mapped.json`：
 
 ```json
 [
   {"start": 2.5, "end": 7.0, "narration": "解说文本", "pause_after_ms": 600, "overlaps_speech": false}
+]
+```
+
+## clip_plan.json
+
+cut 模式下 Agent 选择要保留的原片片段，数组或 `{ "clips": [...] }` 都可接受。默认片段不能重叠，避免同一原片时间映射到多个输出位置：
+
+```json
+{
+  "target_duration": "10m",
+  "clips": [
+    {"start": 12.0, "end": 38.0, "reason": "冲突开端"}
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `start` | float | 原视频片段开始秒数 |
+| `end` | float | 原视频片段结束秒数 |
+| `reason` | string | 选择该片段的剧情/信息原因 |
+
+## clip_plan_validated.json
+
+CLI 校验 `clip_plan.json` 后写出，额外包含输出时间轴：
+
+```json
+{
+  "clips": [
+    {
+      "clip_id": 0,
+      "source_start": 12.0,
+      "source_end": 38.0,
+      "output_start": 0.0,
+      "output_end": 26.0,
+      "duration": 26.0,
+      "reason": "冲突开端"
+    }
+  ],
+  "total_duration": 26.0,
+  "target_duration": 600.0
+}
+```
+
+## narration_mapped.json
+
+cut 模式下由 CLI 生成，`start/end` 已变成短视频输出时间，`source_start/source_end` 保留原视频时间：
+
+```json
+[
+  {
+    "start": 2.0,
+    "end": 7.0,
+    "source_start": 14.0,
+    "source_end": 19.0,
+    "source_clip_id": 0,
+    "narration": "解说文本"
+  }
 ]
 ```
 

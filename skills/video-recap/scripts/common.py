@@ -17,7 +17,17 @@ def log(msg):
 
 def run_cmd(cmd, **kwargs):
     """运行命令，返回 CompletedProcess"""
-    log(f"运行: {' '.join(str(c) for c in cmd) if isinstance(cmd, list) else cmd}")
+    if isinstance(cmd, list):
+        display_parts = []
+        for part in cmd:
+            text = str(part)
+            display_parts.append(text if len(text) <= 240 else text[:237] + "...")
+        display = " ".join(display_parts)
+    else:
+        display = str(cmd)
+        if len(display) > 2000:
+            display = display[:1997] + "..."
+    log(f"运行: {display}")
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 

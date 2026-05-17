@@ -124,6 +124,9 @@ def _normalise_narration_segment(seg, scenes_analysis=None):
         "pause_after_ms": pause,
         "overlaps_speech": bool(seg.get("overlaps_speech", False)),
     }
+    for optional_key in ("source_start", "source_end", "source_clip_id"):
+        if optional_key in seg:
+            item[optional_key] = seg[optional_key]
     if scenes_analysis:
         parent = _find_scene_for_midpoint(scenes_analysis, item["start"], item["end"])
         if parent:
@@ -275,27 +278,64 @@ def _quiet_windows_for_scene(silence_periods, scene):
 
 
 def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_duration, work_dir, style="纪录片"):
-    """Write a compact brief that tells the agent exactly how to author narration.json."""
+    """Write a compact brief that tells the agent exactly how to author recap artifacts."""
     effective_rate = CONFIG["speech_rate"] * CONFIG["speech_safety_margin"]
     breath_sec = CONFIG.get("breath_ms", 600) / 1000
+    edit_mode = CONFIG.get("edit_mode", "full")
+    target_duration = CONFIG.get("target_duration") or "(not set)"
     lines = [
         "# Agent Narration Brief",
         "",
-        "Write `narration.json` manually from the artifacts in this work directory.",
+        "Write the required JSON artifact(s) manually from the analysis files in this work directory.",
         "The CLI will not generate final narration text; it will only validate timing, run TTS, and assemble the video.",
         "",
         f"- Style: {style}",
-        f"- Video duration: {video_duration:.1f}s",
+        f"- Edit mode: {edit_mode}",
+        f"- Source video duration: {video_duration:.1f}s",
+        f"- Target duration (cut mode): {target_duration}",
         f"- Effective speech budget: {effective_rate:.2f} Chinese chars/sec after {breath_sec:.1f}s pause allowance",
         f"- Context: {CONFIG.get('context_info') or '(none)'}",
         "",
-        "## Required JSON shape",
-        "",
-        "```json",
-        "[",
-        "  {\"start\": 5.0, \"end\": 12.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 600, \"overlaps_speech\": false}",
-        "]",
-        "```",
+    ]
+
+    if edit_mode == "cut":
+        lines.extend([
+            "## Required files for cut mode",
+            "",
+            "First write `clip_plan.json` to choose source footage, then write `narration.json` using ORIGINAL source timestamps inside those clips.",
+            "The CLI maps source timestamps to the edited timeline after concatenating clips.",
+            "",
+            "### clip_plan.json shape",
+            "",
+            "```json",
+            "{",
+            "  \"target_duration\": \"10m\",",
+            "  \"clips\": [",
+            "    {\"start\": 12.0, \"end\": 38.0, \"reason\": \"关键冲突开端\"}",
+            "  ]",
+            "}",
+            "```",
+            "",
+            "### narration.json shape (source timestamps)",
+            "",
+            "```json",
+            "[",
+            "  {\"start\": 14.0, \"end\": 21.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 600, \"overlaps_speech\": false}",
+            "]",
+            "```",
+        ])
+    else:
+        lines.extend([
+            "## Required JSON shape",
+            "",
+            "```json",
+            "[",
+            "  {\"start\": 5.0, \"end\": 12.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 600, \"overlaps_speech\": false}",
+            "]",
+            "```",
+        ])
+
+    lines.extend([
         "",
         "## Writing rules",
         "",
@@ -303,11 +343,12 @@ def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_durati
         "2. Prefer quiet windows. Use `overlaps_speech=true` only when narration intentionally overlaps original dialogue.",
         "3. Keep each line under its max character budget; shorter is safer for edge-tts.",
         "4. Preserve original audio moments that carry important dialogue or atmosphere.",
-        "5. After writing, run: `python3 skills/video-recap/scripts/video_recap.py <video> --resume <work_dir>`.",
+        "5. In cut mode, select clips for plot causality, key dialogue, reveals, and emotional turns; avoid filler and repeated shots.",
+        "6. After writing, run: `python3 skills/video-recap/scripts/video_recap.py <video> --resume <work_dir>`.",
         "",
         "## Scene timing guide",
         "",
-    ]
+    ])
 
     for scene in scenes_analysis:
         duration = scene["end"] - scene["start"]

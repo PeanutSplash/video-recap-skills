@@ -62,6 +62,14 @@ def main():
                         help="单段 TTS 命令超时秒数 (默认: TTS_TIMEOUT 或配置值)")
     parser.add_argument("--allow-partial-tts", action="store_true",
                         help="允许部分 TTS 段失败后继续组装（默认失败即中止）")
+    parser.add_argument("--edit-mode", choices=["full", "cut"], default=None,
+                        help="成片模式：full 保留全片；cut 使用 Agent 写的 clip_plan.json 剪成短解说")
+    parser.add_argument("--target-duration", type=str, default=None,
+                        help="cut 模式目标成片时长，如 600、10m、00:10:00")
+    parser.add_argument("--clip-padding", type=float, default=None,
+                        help="cut 模式每个片段两端扩展秒数 (默认: 0)")
+    parser.add_argument("--allow-clip-overlap", action="store_true",
+                        help="cut 模式允许重复/重叠使用原片；重复片段的 narration 需写 source_clip_id")
 
     args = parser.parse_args()
 
@@ -88,6 +96,14 @@ def main():
         CONFIG["scene_threshold"] = args.scene_threshold
     if args.ducking:
         CONFIG["ducking_mode"] = args.ducking
+    if args.edit_mode:
+        CONFIG["edit_mode"] = args.edit_mode
+    if args.target_duration is not None:
+        CONFIG["target_duration"] = args.target_duration
+    if args.clip_padding is not None:
+        CONFIG["clip_padding"] = max(0.0, args.clip_padding)
+    if args.allow_clip_overlap:
+        CONFIG["allow_clip_overlap"] = True
 
     if args.doctor:
         from doctor import main as doctor_main

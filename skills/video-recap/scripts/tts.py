@@ -86,14 +86,7 @@ def _synthesize_segment(i, seg, narration, tts_dir, engine):
         existing_dur = _get_audio_duration(output_wav)
         if existing_dur > 0:
             log(f"  段 {i+1}: 复用已有 ({existing_dur:.1f}s)")
-            return {
-                "index": i, "start": seg["start"], "end": seg["end"],
-                "narration": text, "audio_path": str(output_wav),
-                "audio_duration": existing_dur,
-                "tts_rate_offset": 0.0,
-                "pause_after_ms": seg.get("pause_after_ms", CONFIG.get("breath_ms", 600)),
-                "overlaps_speech": seg.get("overlaps_speech", False),
-            }
+            return _build_tts_segment_result(i, seg, text, output_wav, existing_dur, 0.0)
 
     if CONFIG.get("tts_dynamic_params", True):
         rate, pitch = _compute_tts_params(text, narration, i)
@@ -116,17 +109,25 @@ def _synthesize_segment(i, seg, narration, tts_dir, engine):
             _run_tts_engine(engine, text, output_wav, rate=rate, pitch=pitch)
             dur = _get_audio_duration(output_wav)
 
-    return {
-        "index": i,
+    return _build_tts_segment_result(i, seg, text, output_wav, dur, _parse_rate_offset(rate))
+
+
+def _build_tts_segment_result(index, seg, text, output_wav, duration, rate_offset):
+    result = {
+        "index": index,
         "start": seg["start"],
         "end": seg["end"],
         "narration": text,
         "audio_path": str(output_wav),
-        "audio_duration": dur,
-        "tts_rate_offset": _parse_rate_offset(rate),
+        "audio_duration": duration,
+        "tts_rate_offset": rate_offset,
         "pause_after_ms": seg.get("pause_after_ms", CONFIG.get("breath_ms", 600)),
         "overlaps_speech": seg.get("overlaps_speech", False),
     }
+    for optional_key in ("source_start", "source_end", "source_clip_id"):
+        if optional_key in seg:
+            result[optional_key] = seg[optional_key]
+    return result
 
 
 def synthesize_tts(narration, work_dir):

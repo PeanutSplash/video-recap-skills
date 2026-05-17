@@ -23,6 +23,10 @@
 | `--tts-workers` | TTS 并行线程数 | `$TTS_WORKERS` 或 4 | TTS 服务不稳定时调低 |
 | `--tts-timeout` | 单段 TTS 超时秒数 | `$TTS_TIMEOUT` 或 90 | 长文本或网络慢时调高 |
 | `--allow-partial-tts` | 允许部分 TTS 失败后继续组装 | false | 应急产出时开启 |
+| `--edit-mode` | 成片模式: full / cut | full | `cut` 表示 Agent 选择画面片段，先剪短再解说 |
+| `--target-duration` | cut 模式目标成片时长，如 `600` / `10m` / `00:10:00` | - | 作为选片规划目标；超出较多会警告 |
+| `--clip-padding` | cut 模式每个片段两端扩展秒数 | 0 | 片段切得太紧时加 0.5-1.0 |
+| `--allow-clip-overlap` | cut 模式允许重复/重叠使用原片 | false | 少数需要重复画面时开启；对应解说建议写 `source_clip_id` |
 | `--doctor` | 检查运行依赖和配置 | false | 首次安装或排查环境时使用 |
 | `--doctor-tts-smoke` | doctor 时试合成一小段 edge-tts | false | 验证 TTS 网络/音色是否可用 |
 
@@ -40,3 +44,8 @@
 | `TTS_TIMEOUT` | 单段 TTS 命令超时秒数 | 90 | 网络慢时调高 |
 | `TTS_RETRIES` | 单段 TTS 重试次数 | 3 | edge-tts 偶发失败时调高 |
 | `ALLOW_PARTIAL_TTS` | 部分 TTS 失败是否继续 | false | 调试或应急产出时设为 1 |
+| `EDIT_MODE` | 默认成片模式: full / cut | full | 常用剪辑式解说时可设为 `cut` |
+| `TARGET_DURATION` | cut 模式默认目标成片时长 | - | 例如 `10m` |
+| `CLIP_PADDING` | cut 模式默认片段 padding 秒数 | 0 | 例如 `0.5` |
+| `ALLOW_CLIP_OVERLAP` | cut 模式是否允许重复/重叠使用原片 | false | 重复画面需要明确映射时设为 1 |
+| `FORCE_VIDEO_REENCODE` | 组装阶段是否强制重编码视频 | false | 输出容器时间戳异常时设为 1 |

@@ -71,6 +71,7 @@ flowchart TB
 - **写稿前先给时间预算**：`agent_narration_brief.md` 标出安静窗口、对白重叠、场景时长和字数预算。
 - **保留原声质感**：解说出现时动态压低原声，尽量保留对白、环境声和原片节奏。
 - **改稿后低成本续跑**：直接编辑 `narration.json`，通常只重跑 TTS/组装，不必重新分析视频。
+- **支持剪辑式解说**：`--edit-mode cut` 下用 `clip_plan.json` 选择原片片段，可把长视频剪成短解说。
 - **默认配音不需要 key**：优先使用 `edge-tts` 和 `zh-CN-YunxiNeural`。
 
 ## 安装
@@ -123,6 +124,17 @@ python3 skills/video-recap/scripts/video_recap.py /path/to/video.mp4 \
 
 命令会在 TTS 前暂停并输出 `work_dir`。读取 `work_dir/agent_narration_brief.md`，写入 `work_dir/narration.json` 后，再执行打印出的续跑命令。
 
+如果要做“长视频剪短”的剪辑式解说（目标时长是选片规划目标）：
+
+```bash
+python3 skills/video-recap/scripts/video_recap.py /path/to/video.mp4 \
+  --edit-mode cut \
+  --target-duration 10m \
+  --tts edge-tts
+```
+
+cut 模式下同时写 `work_dir/clip_plan.json` 和 `work_dir/narration.json`，时间戳都用原视频时间。CLI 会生成 `edited_source.mp4`，把解说映射到 `narration_mapped.json`，再继续 TTS/组装。
+
 ### Doctor 自检
 
 ```bash
@@ -139,6 +151,9 @@ python3 skills/video-recap/scripts/video_recap.py --doctor
 - `work_dir/subtitles.srt`：生成字幕
 - `work_dir/agent_narration_brief.md`：给 Agent 写解说词用的场景与时长 brief
 - `work_dir/narration.json`：解说词稿
+- `work_dir/clip_plan.json`：cut 模式下要保留的原片片段
+- `work_dir/edited_source.mp4`：cut 模式下拼出的短视频源
+- `work_dir/narration_mapped.json`：从原视频时间映射到短视频时间的解说稿
 - `work_dir/vlm_analysis.json`：场景级视觉分析
 - `work_dir/asr_result.json`：可用时的 ASR 转写结果
 - `work_dir/tts_segments/`：分段 TTS 音频

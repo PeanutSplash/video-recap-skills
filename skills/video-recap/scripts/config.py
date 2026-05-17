@@ -34,6 +34,20 @@ def env_bool(name, default=False):
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def env_float(name, default, *, minimum=None):
+    """Read a float env var; ignore malformed values instead of crashing import."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
 CONFIG = {
     "api_url": normalize_api_url(os.environ.get("OPENAI_API_URL")),
     "api_key": os.environ.get("OPENAI_API_KEY", ""),
@@ -89,8 +103,13 @@ CONFIG = {
     "tts_timeout": env_int("TTS_TIMEOUT", 90, minimum=1),  # 单段 TTS 命令超时秒数
     "tts_retries": env_int("TTS_RETRIES", 3, minimum=1),  # 单段 TTS 失败重试次数
     "allow_partial_tts": env_bool("ALLOW_PARTIAL_TTS", False),
+    "edit_mode": os.environ.get("EDIT_MODE", "full"),  # full | cut
+    "target_duration": os.environ.get("TARGET_DURATION", ""),  # cut 模式目标成片时长，如 10m
+    "clip_padding": env_float("CLIP_PADDING", 0.0, minimum=0.0),  # cut 模式片段两端扩展秒数
+    "allow_clip_overlap": env_bool("ALLOW_CLIP_OVERLAP", False),  # cut 模式是否允许重复/重叠使用原片
     "skip_narrative_analysis": True,  # 跳过叙事结构分析（省57-130s，对质量影响极小）
     "burn_subtitles": False,  # 烧录字幕到视频（需要重编码）
+    "force_video_reencode": env_bool("FORCE_VIDEO_REENCODE", False),  # 组装时重编码视频，修复部分容器时间戳问题
 }
 
 SCRIPT_DIR = Path(__file__).parent

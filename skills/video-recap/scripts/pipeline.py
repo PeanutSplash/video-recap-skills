@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,13 @@ from narration import (
 )
 from tts import synthesize_tts
 from assemble import assemble_video
+from edit import (
+    build_edited_source_video,
+    load_clip_plan,
+    map_narration_to_clips,
+    normalize_clip_plan,
+    parse_duration_seconds,
+)
 
 # ── Prerequisites ─────────────────────────────────────────────────────
 
@@ -70,13 +78,202 @@ def _load_json_file(path, label):
         raise FileNotFoundError(f"缺少 {label}: {path}") from exc
 
 
+def _cut_mode_enabled():
+    return CONFIG.get("edit_mode", "full") == "cut"
+
+
+def _run_settings_path(work_dir):
+    return work_dir / "run_settings.json"
+
+
+def _persist_run_settings(work_dir):
+    settings = {
+        "edit_mode": CONFIG.get("edit_mode", "full"),
+        "target_duration": CONFIG.get("target_duration", ""),
+        "clip_padding": CONFIG.get("clip_padding", 0.0),
+        "allow_clip_overlap": CONFIG.get("allow_clip_overlap", False),
+    }
+    _run_settings_path(work_dir).write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    return settings
+
+
+def _load_run_settings(work_dir):
+    path = _run_settings_path(work_dir)
+    if not path.exists():
+        return {}
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"警告: run_settings.json 读取失败，使用当前 CLI 配置: {exc}")
+        return {}
+    if not isinstance(settings, dict):
+        return {}
+    for key in ("edit_mode", "target_duration", "clip_padding", "allow_clip_overlap"):
+        if key in settings and settings[key] is not None:
+            CONFIG[key] = settings[key]
+    return settings
+
+
+def _resume_command(cli_path, video_path, work_dir):
+    parts = ["python3", str(cli_path), str(video_path), "--resume", str(work_dir)]
+    if _cut_mode_enabled():
+        parts.extend(["--edit-mode", "cut"])
+        if CONFIG.get("target_duration"):
+            parts.extend(["--target-duration", str(CONFIG["target_duration"])])
+        try:
+            clip_padding = float(CONFIG.get("clip_padding", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            clip_padding = 0.0
+        if clip_padding > 0:
+            parts.extend(["--clip-padding", f"{clip_padding:g}"])
+        if CONFIG.get("allow_clip_overlap", False):
+            parts.append("--allow-clip-overlap")
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _target_duration_seconds():
+    return parse_duration_seconds(CONFIG.get("target_duration"))
+
+
+def _annotate_cut_narration_overlap(narration, silence_periods):
+    """Preserve source timestamps, but correct overlaps_speech from source quiet windows."""
+    quiet_windows = [w for w in silence_periods or [] if not w.get("has_speech", False)]
+    if not quiet_windows:
+        for seg in narration or []:
+            if isinstance(seg, dict):
+                seg["overlaps_speech"] = True
+        return narration
+
+    for seg in narration or []:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            start = float(seg.get("start"))
+            end = float(seg.get("end"))
+        except (TypeError, ValueError):
+            seg["overlaps_speech"] = True
+            continue
+        duration = max(0.0, end - start)
+        quiet_overlap = 0.0
+        for qw in quiet_windows:
+            overlap_start = max(start, float(qw.get("start", 0)))
+            overlap_end = min(end, float(qw.get("end", 0)))
+            quiet_overlap += max(0.0, overlap_end - overlap_start)
+        seg["overlaps_speech"] = quiet_overlap < max(0.3, duration * 0.5)
+    return narration
+
+
+def _prepare_cut_mode_artifacts(video_path, work_dir, narration, *, validate_budget=True):
+    """Validate clip_plan.json, build edited_source.mp4, and map narration to output time."""
+    clip_plan_path = work_dir / "clip_plan.json"
+    raw_plan = load_clip_plan(clip_plan_path)
+    validated_plan = normalize_clip_plan(
+        raw_plan,
+        get_video_duration(video_path),
+        target_duration=_target_duration_seconds(),
+        clip_padding=CONFIG.get("clip_padding", 0.0),
+        allow_overlap=bool(CONFIG.get("allow_clip_overlap", False)),
+    )
+    validated_path = work_dir / "clip_plan_validated.json"
+    validated_path.write_text(json.dumps(validated_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    edited_source_path = work_dir / "edited_source.mp4"
+    source_mtime = max(
+        clip_plan_path.stat().st_mtime,
+        (work_dir / "narration.json").stat().st_mtime if (work_dir / "narration.json").exists() else 0,
+    )
+    if edited_source_path.exists() and edited_source_path.stat().st_mtime >= clip_plan_path.stat().st_mtime:
+        edited_source = edited_source_path
+        log(f"复用剪辑源视频: {edited_source}")
+    else:
+        edited_source = build_edited_source_video(video_path, validated_plan, work_dir, edited_source_path)
+    mapped_narration = map_narration_to_clips(narration, validated_plan)
+    if validate_budget:
+        edited_scenes = [{
+            "scene_id": c["clip_id"],
+            "start": c["output_start"],
+            "end": c["output_end"],
+            "description": c.get("reason", "selected source clip"),
+        } for c in validated_plan["clips"]]
+        mapped_narration = _validate_narration_budget(mapped_narration, edited_scenes)
+    if not mapped_narration:
+        raise ValueError("narration.json 没有落入 clip_plan.json 片段内的有效解说")
+    mapped_path = work_dir / "narration_mapped.json"
+    mapped_path.write_text(json.dumps(mapped_narration, ensure_ascii=False, indent=2), encoding="utf-8")
+    if mapped_path.stat().st_mtime < source_mtime:
+        mapped_path.touch()
+    _step_done(work_dir, "edit")
+    log(f"剪辑模式: {len(validated_plan['clips'])} 个片段 → {validated_plan['total_duration']:.1f}s")
+    return edited_source, mapped_narration, validated_plan
+
+
+def _cut_artifacts_current(work_dir):
+    if not _cut_mode_enabled():
+        return True
+    clip_plan_path = work_dir / "clip_plan.json"
+    narration_path = work_dir / "narration.json"
+    validated_path = work_dir / "clip_plan_validated.json"
+    mapped_path = work_dir / "narration_mapped.json"
+    edited_path = work_dir / "edited_source.mp4"
+    required = [clip_plan_path, narration_path, validated_path, mapped_path, edited_path]
+    if not all(path.exists() for path in required):
+        return False
+    clip_mtime = clip_plan_path.stat().st_mtime
+    narration_mtime = narration_path.stat().st_mtime
+    return (
+        validated_path.stat().st_mtime >= clip_mtime
+        and edited_path.stat().st_mtime >= clip_mtime
+        and mapped_path.stat().st_mtime >= max(clip_mtime, narration_mtime)
+    )
+
+
+def _artifact_current(output_path, source_paths):
+    if not output_path.exists():
+        return False
+    existing_sources = [Path(path) for path in source_paths if path and Path(path).exists()]
+    if not existing_sources:
+        return True
+    return output_path.stat().st_mtime >= max(path.stat().st_mtime for path in existing_sources)
+
+
+def _clear_tts_cache(work_dir):
+    shutil.rmtree(work_dir / "tts_segments", ignore_errors=True)
+    for path in (work_dir / "tts_meta.json", work_dir / ".step_tts.done"):
+        path.unlink(missing_ok=True)
+
+
+def _ensure_cut_tail_artifacts(video_path, work_dir):
+    if _cut_mode_enabled() and not _cut_artifacts_current(work_dir):
+        narration = _load_json_file(work_dir / "narration.json", "narration.json")
+        _prepare_cut_mode_artifacts(video_path, work_dir, narration, validate_budget=False)
+
+
+def _load_tail_narration(work_dir):
+    if _cut_mode_enabled() and (work_dir / "narration_mapped.json").exists():
+        return _load_json_file(work_dir / "narration_mapped.json", "narration_mapped.json")
+    return _load_json_file(work_dir / "narration.json", "narration.json")
+
+
+def _tail_video_path(video_path, work_dir):
+    edited = work_dir / "edited_source.mp4"
+    if _cut_mode_enabled() and edited.exists():
+        return edited
+    return video_path
+
+
 def _run_cached_tail_step(video_path, work_dir, step, style, output_dir):
     """Run tts/assemble from existing artifacts without VLM/API prerequisites."""
     if step not in ("tts", "assemble"):
         return None
 
+    if _cut_mode_enabled():
+        _ensure_cut_tail_artifacts(video_path, work_dir)
+
+    narration_artifact_path = work_dir / "narration_mapped.json" if _cut_mode_enabled() else work_dir / "narration.json"
+
     if step == "tts":
-        narration = _load_json_file(work_dir / "narration.json", "narration.json")
+        _clear_tts_cache(work_dir)
+        narration = _load_tail_narration(work_dir)
         tts_segments, engine_used = synthesize_tts(narration, work_dir)
         tts_meta = work_dir / "tts_meta.json"
         tts_meta.write_text(json.dumps({
@@ -87,11 +284,12 @@ def _run_cached_tail_step(video_path, work_dir, step, style, output_dir):
         return {"segments": tts_segments, "engine": engine_used}
 
     tts_meta = work_dir / "tts_meta.json"
-    if tts_meta.exists():
+    if _artifact_current(tts_meta, [narration_artifact_path]):
         tts_info = _load_json_file(tts_meta, "tts_meta.json")
         tts_segments = tts_info["segments"]
     else:
-        narration = _load_json_file(work_dir / "narration.json", "narration.json")
+        _clear_tts_cache(work_dir)
+        narration = _load_tail_narration(work_dir)
         tts_segments, engine_used = synthesize_tts(narration, work_dir)
         tts_meta.write_text(json.dumps({
             "segments": tts_segments, "engine": engine_used
@@ -99,7 +297,8 @@ def _run_cached_tail_step(video_path, work_dir, step, style, output_dir):
         _step_done(work_dir, "tts")
 
     output_path = work_dir / "output.mp4"
-    assemble_video(video_path, tts_segments, work_dir, output_path)
+    assembly_input = _tail_video_path(video_path, work_dir)
+    assemble_video(assembly_input, tts_segments, work_dir, output_path)
     _step_done(work_dir, "assemble")
 
     final_output = Path(output_dir) / f"recap_{video_path.stem}.mp4" if output_dir else work_dir.parent / f"recap_{video_path.stem}.mp4"
@@ -131,8 +330,13 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         work_dir = output_dir / f"work_{int(time.time())}"
 
     work_dir.mkdir(exist_ok=True)
+    if resume_dir:
+        _load_run_settings(work_dir)
+    else:
+        _persist_run_settings(work_dir)
     log(f"工作目录: {work_dir}")
     log(f"输入视频: {video_path}")
+    log(f"成片模式: {CONFIG.get('edit_mode', 'full')}")
 
     # 如果指定了 step，只执行那一步
     steps = {
@@ -140,7 +344,7 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         "detect": lambda: detect_scenes(video_path, work_dir, scene_threshold),
         "asr": lambda: transcribe_audio(video_path, work_dir) if not skip_asr else [],
         "analyze": None,  # 需要前置数据
-        "script": None,   # Agent-authored narration.json validation
+        "script": None,   # Agent-authored narration.json / clip_plan.json validation
         "tts": None,      # 需要前置数据
         "assemble": None, # 需要前置数据
     }
@@ -259,45 +463,75 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         _step_done(work_dir, "narrative")
         log(f"[{time.time()-t0:.1f}s] 叙事结构分析完成")
 
-    # Step 5: Agent-authored narration script
+    # Step 5: Agent-authored narration script and optional clip plan
     narration_path = work_dir / "narration.json"
+    clip_plan_path = work_dir / "clip_plan.json"
+    cut_mode = _cut_mode_enabled()
+    required_ready = narration_path.exists() and (not cut_mode or clip_plan_path.exists())
+    source_narration = None
+    assembly_video_path = video_path
+    validated_plan = None
+
     if _is_step_done(work_dir, "script"):
-        narration = _load_json_file(narration_path, "narration.json")
-        narration = _validate_narration_budget(narration, vlm_analysis)
-        log(f"跳过解说词写作（已存在 {len(narration)} 段）")
-    elif narration_path.exists():
-        narration = _load_json_file(narration_path, "narration.json")
-        narration = _validate_narration_budget(narration, vlm_analysis)
-        narration = _align_narration_to_quiet(narration, vlm_analysis, silence_periods)
-        narration_path.write_text(json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8")
+        source_narration = _load_json_file(narration_path, "narration.json")
+        source_narration = _validate_narration_budget(source_narration, vlm_analysis)
+        log(f"跳过解说词写作（已存在 {len(source_narration)} 段）")
+    elif required_ready:
+        source_narration = _load_json_file(narration_path, "narration.json")
+        source_narration = _validate_narration_budget(source_narration, vlm_analysis)
+        if not cut_mode:
+            source_narration = _align_narration_to_quiet(source_narration, vlm_analysis, silence_periods)
+            narration_path.write_text(json.dumps(source_narration, ensure_ascii=False, indent=2), encoding="utf-8")
         _step_done(work_dir, "script")
-        log(f"Agent 解说词验证完成: {len(narration)} 段")
+        log(f"Agent 解说词验证完成: {len(source_narration)} 段")
     else:
         brief_path = build_agent_brief(vlm_analysis, asr_result, silence_periods, video_duration, work_dir, style)
         log("=" * 50)
         log("⏸  Pipeline 在解说词步骤暂停")
-        log(f"   请 Agent 阅读 {brief_path} 后写入 {narration_path}")
+        if cut_mode:
+            log(f"   请 Agent 阅读 {brief_path} 后写入 {clip_plan_path} 和 {narration_path}")
+            next_step = "write clip_plan.json and narration.json"
+        else:
+            log(f"   请 Agent 阅读 {brief_path} 后写入 {narration_path}")
+            next_step = "write narration.json"
         cli_path = Path(__file__).with_name("video_recap.py")
         log("   写完后继续执行:")
-        log(f"   python3 {cli_path} {video_path} --resume {work_dir}")
+        log(f"   {_resume_command(cli_path, video_path, work_dir)}")
         log("=" * 50)
         (work_dir / ".step_script.paused").write_text("", encoding="utf-8")
         return {
             "status": "paused",
             "work_dir": str(work_dir),
             "brief": str(brief_path),
-            "next_step": "write narration.json",
+            "next_step": next_step,
+            "edit_mode": CONFIG.get("edit_mode", "full"),
         }
+
+    if cut_mode:
+        if source_narration is not None:
+            source_narration = _annotate_cut_narration_overlap(source_narration, silence_periods)
+        if _is_step_done(work_dir, "edit") and _cut_artifacts_current(work_dir):
+            assembly_video_path = work_dir / "edited_source.mp4"
+            narration = _load_json_file(work_dir / "narration_mapped.json", "narration_mapped.json")
+            if (work_dir / "clip_plan_validated.json").exists():
+                validated_plan = _load_json_file(work_dir / "clip_plan_validated.json", "clip_plan_validated.json")
+            log(f"跳过剪辑映射（已存在 {assembly_video_path}）")
+        else:
+            assembly_video_path, narration, validated_plan = _prepare_cut_mode_artifacts(video_path, work_dir, source_narration)
+    else:
+        narration = source_narration
 
     # Step 6: TTS
     tts_meta = work_dir / "tts_meta.json"
-    if _is_step_done(work_dir, "tts") and tts_meta.exists():
+    narration_artifact_path = work_dir / "narration_mapped.json" if cut_mode else narration_path
+    if _is_step_done(work_dir, "tts") and _artifact_current(tts_meta, [narration_artifact_path]):
         tts_info = json.loads(tts_meta.read_text())
         tts_segments = tts_info["segments"]
         engine_used = tts_info["engine"]
         log(f"跳过 TTS（已存在 {len(tts_segments)} 段, 引擎: {engine_used}）")
     else:
         t0 = time.time()
+        _clear_tts_cache(work_dir)
         tts_segments, engine_used = synthesize_tts(narration, work_dir)
         tts_meta.write_text(json.dumps({
             "segments": tts_segments, "engine": engine_used
@@ -307,11 +541,11 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
 
     # Step 7: 组装
     output_path = work_dir / "output.mp4"
-    if _is_step_done(work_dir, "assemble") and output_path.exists():
+    if _is_step_done(work_dir, "assemble") and _artifact_current(output_path, [tts_meta, assembly_video_path]):
         log("跳过视频组装（已存在）")
     else:
         t0 = time.time()
-        assemble_video(video_path, tts_segments, work_dir, output_path)
+        assemble_video(assembly_video_path, tts_segments, work_dir, output_path)
         _step_done(work_dir, "assemble")
         log(f"[{time.time()-t0:.1f}s] 视频组装完成")
 
@@ -326,12 +560,14 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     log("=" * 50)
     log(f"完成! 输出: {final_output}")
     log(f"工作目录: {work_dir}")
+    if cut_mode and validated_plan:
+        log(f"剪辑片段: {len(validated_plan['clips'])} | 剪辑时长: {validated_plan['total_duration']:.1f}s")
     log(f"场景: {len(scenes)} | 解说段: {len(narration)} | TTS: {engine_used}")
 
     # 质量指标（基于 vlm_analysis 场景，与解说生成一致）
     covered = set()
     for n in narration:
-        n_mid = (n.get("start", 0) + n.get("end", 0)) / 2
+        n_mid = (n.get("source_start", n.get("start", 0)) + n.get("source_end", n.get("end", 0))) / 2
         for s in vlm_analysis:
             if s["start"] <= n_mid <= s["end"]:
                 covered.add(s["scene_id"])
@@ -355,6 +591,8 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         "scenes": len(scenes),
         "narration_segments": len(narration),
         "tts_engine": engine_used,
+        "edit_mode": CONFIG.get("edit_mode", "full"),
+        "edited_duration": validated_plan.get("total_duration") if validated_plan else None,
         "coverage": f"{coverage_pct:.0f}%",
         "overlaps": overlaps,
         "total_seconds": round(total_time),

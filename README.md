@@ -71,6 +71,7 @@ flowchart TB
 - **Timing-aware writing brief** — `agent_narration_brief.md` includes quiet windows, dialogue overlap, scene timing, and word budgets.
 - **Original audio stays alive** — voiceover is mixed with ducking instead of replacing dialogue, ambience, and rhythm.
 - **Script-first reruns** — edit `narration.json`, then rerun TTS/assembly without redoing video analysis.
+- **Cut-style recaps** — in `--edit-mode cut`, select source ranges in `clip_plan.json` to turn long videos into shorter narrated edits.
 - **No-key TTS path** — defaults to `edge-tts` with `zh-CN-YunxiNeural` when available.
 
 ## Installation
@@ -123,6 +124,17 @@ python3 skills/video-recap/scripts/video_recap.py /path/to/video.mp4 \
 
 The command pauses before TTS and prints a `work_dir`. Read `work_dir/agent_narration_brief.md`, write `work_dir/narration.json`, then run the printed resume command.
 
+For an edited recap that keeps only selected source moments (target duration is a planning goal):
+
+```bash
+python3 skills/video-recap/scripts/video_recap.py /path/to/video.mp4 \
+  --edit-mode cut \
+  --target-duration 10m \
+  --tts edge-tts
+```
+
+In cut mode, write both `work_dir/clip_plan.json` and `work_dir/narration.json` using original source timestamps. The CLI builds `edited_source.mp4`, maps narration into `narration_mapped.json`, then resumes TTS/assembly.
+
 ### Doctor check
 
 ```bash
@@ -139,6 +151,9 @@ Typical outputs:
 - `work_dir/subtitles.srt` — generated subtitles
 - `work_dir/agent_narration_brief.md` — timing and scene brief for the agent
 - `work_dir/narration.json` — recap narration script
+- `work_dir/clip_plan.json` — source ranges to keep when `--edit-mode cut` is used
+- `work_dir/edited_source.mp4` — concatenated short source video in cut mode
+- `work_dir/narration_mapped.json` — narration mapped from source time to edited-output time
 - `work_dir/vlm_analysis.json` — scene-level visual analysis
 - `work_dir/asr_result.json` — ASR result when available
 - `work_dir/tts_segments/` — generated TTS audio segments

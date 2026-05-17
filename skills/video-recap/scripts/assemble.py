@@ -215,6 +215,8 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
         srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
         cmd += ["-vf", f"subtitles={srt_escaped}", "-c:v", "libx264", "-crf", "18"]
         log("烧录字幕（需要重编码）...")
+    elif CONFIG.get("force_video_reencode", False):
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
     else:
         cmd += ["-c:v", "copy"]
 

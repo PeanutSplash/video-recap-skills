@@ -5,8 +5,8 @@ description: >
  Use when the user provides a video file (.mp4 / .mov / .mkv / .webm) and asks
  to add narration, generate voiceover, dub, summarize, or produce a recap.
  Supports: 短剧 / 电视剧 / 电影 / 纪录片 / 科普视频.
- Pipeline: scene detection → VLM analysis → ASR → agent writes narration.json →
- TTS → assembly.
+ Pipeline: scene detection → VLM analysis → ASR → agent writes narration.json
+ (optional cut mode: agent writes clip_plan.json) → TTS → assembly.
  触发词: 视频解说, 视频旁白, 生成解说, 视频recap, video recap, voiceover,
  narration, auto-dub, recap.
 ---
@@ -46,9 +46,15 @@ ln -s /tmp/video-recap-repo/skills/video-recap ~/.claude/skills/video-recap
 python3 scripts/video_recap.py <video> --tts edge-tts --context "背景"
 ```
 
+剪辑式解说（长视频剪短）加：
+
+```bash
+python3 scripts/video_recap.py <video> --edit-mode cut --target-duration 10m --tts edge-tts
+```
+
 ### 2. 撰写解说词
 
-读取 `work_dir/agent_narration_brief.md` 以及 vlm_analysis / asr_result / silence_periods，写 `work_dir/narration.json`。
+读取 `work_dir/agent_narration_brief.md` 以及 vlm_analysis / asr_result / silence_periods，写 `work_dir/narration.json`。cut 模式还要写 `work_dir/clip_plan.json`，时间戳都使用原视频时间。
 字段格式与写作规则见 `agent-mode-workflow.md`。
 
 ### 3. （可选）背景调研
@@ -61,7 +67,7 @@ python3 scripts/video_recap.py <video> --tts edge-tts --context "背景"
 python3 scripts/video_recap.py <video> --resume work_dir
 ```
 
-⚠️ 改完 narration.json 后如需重配音，删 `tts_segments/`、`.step_tts.done`、`.step_assemble.done` 和 `tts_meta.json`。
+⚠️ 改完 narration.json 后如需重配音，删 `tts_segments/`、`.step_tts.done`、`.step_assemble.done` 和 `tts_meta.json`。cut 模式下 CLI 会自动检测 `clip_plan.json` / `narration.json` 是否比剪辑产物更新，并重建映射。
 
 ## 自检
 
@@ -75,4 +81,7 @@ python3 scripts/video_recap.py --doctor
 - `subtitles.srt` — 字幕
 - `work_dir/agent_narration_brief.md` — 解说词写作 brief
 - `work_dir/narration.json` — Agent 写的解说词
+- `work_dir/clip_plan.json` — cut 模式下 Agent 选择的原片片段
+- `work_dir/edited_source.mp4` — cut 模式下拼出的短视频源
+- `work_dir/narration_mapped.json` — cut 模式下映射到短视频时间轴的解说词
 - `work_dir/` — 所有中间 JSON
