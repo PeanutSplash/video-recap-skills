@@ -51,6 +51,7 @@ from assemble import (
     _subtitle_burn_filter,
     assembly_settings_fingerprint,
     assemble_video,
+    final_loudnorm_filter,
 )
 from vlm import _mimo_video_chunks, _video_data_url, analyze_scenes, analyze_video_overview
 
@@ -282,6 +283,53 @@ def test_lint_narration_warns_when_segment_spans_too_many_visual_beats(monkeypat
 
     codes = {issue["code"] for issue in report["warnings"]}
     assert "visual_beat_too_broad" in codes
+
+
+def test_lint_narration_density_metrics_and_warnings(monkeypatch):
+    monkeypatch.setitem(CONFIG, "target_segments_per_minute", 9.6)
+    monkeypatch.setitem(CONFIG, "min_segments_per_minute", 6.24)
+    monkeypatch.setitem(CONFIG, "max_narration_gap_seconds", 11.0)
+
+    sparse = lint_narration([
+        {"start": 0.0, "end": 4.0, "narration": "第一句。", "pause_after_ms": 250},
+        {"start": 40.0, "end": 44.0, "narration": "很久之后的第二句。", "pause_after_ms": 250},
+    ], mode="full")
+    sparse_codes = {issue["code"] for issue in sparse["warnings"]}
+    assert "low_density" in sparse_codes
+    assert "long_gap" in sparse_codes
+    assert sparse["metrics"]["segment_count"] == 2
+    assert sparse["metrics"]["max_gap_seconds"] == 36.0
+
+    dense = []
+    t = 0.0
+    for _ in range(10):
+        dense.append({"start": round(t, 2), "end": round(t + 4.5, 2),
+                      "narration": "一句紧凑的解说。", "pause_after_ms": 250})
+        t += 6.0
+    dense_report = lint_narration(dense, mode="full")
+    dense_codes = {issue["code"] for issue in dense_report["warnings"]}
+    assert "low_density" not in dense_codes
+    assert "long_gap" not in dense_codes
+    assert dense_report["metrics"]["segments_per_minute"] >= CONFIG["min_segments_per_minute"]
+
+    cut_report = lint_narration(sparse, mode="cut")
+    assert cut_report["metrics"] == {}
+
+
+def test_final_loudnorm_filter_and_fingerprint(monkeypatch):
+    monkeypatch.setitem(CONFIG, "final_loudnorm", True)
+    monkeypatch.setitem(CONFIG, "target_lufs", -14.0)
+    monkeypatch.setitem(CONFIG, "target_true_peak", -1.0)
+    monkeypatch.setitem(CONFIG, "target_lra", 11.0)
+    assert final_loudnorm_filter() == "loudnorm=I=-14.0:TP=-1.0:LRA=11.0"
+    assert assembly_settings_fingerprint()["audio_mix"]["final_loudnorm"] == "loudnorm=I=-14.0:TP=-1.0:LRA=11.0"
+
+    monkeypatch.setitem(CONFIG, "target_lufs", -11.9)
+    assert final_loudnorm_filter() == "loudnorm=I=-11.9:TP=-1.0:LRA=11.0"
+
+    monkeypatch.setitem(CONFIG, "final_loudnorm", False)
+    assert final_loudnorm_filter() is None
+    assert assembly_settings_fingerprint()["audio_mix"]["final_loudnorm"] == "off"
 
 
 def test_get_video_duration_returns_zero_for_unparseable_output(monkeypatch):

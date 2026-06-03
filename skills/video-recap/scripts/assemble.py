@@ -70,6 +70,7 @@ def assembly_settings_fingerprint():
             "narration_mode": CONFIG.get("narration_mode", "zone"),
             "zone_ducking_volume": CONFIG.get("zone_ducking_volume", 0.12),
             "zone_fade_seconds": CONFIG.get("zone_fade_seconds", 0.5),
+            "final_loudnorm": final_loudnorm_filter() or "off",
         },
     }
     if fingerprint["burn_subtitles"]:
@@ -218,6 +219,21 @@ def _subtitle_burn_filter(subtitle_path):
     return f"subtitles=filename='{_escape_subtitle_filter_path(subtitle_path)}'"
 
 
+def final_loudnorm_filter():
+    """Final-mix loudness normalization filter from CONFIG, or None when disabled.
+
+    Ducking branches set only relative balance; this single stage owns the
+    absolute output loudness so the recap is not left too quiet.
+    """
+    if not CONFIG.get("final_loudnorm", True):
+        return None
+    return (
+        f"loudnorm=I={CONFIG.get('target_lufs', -14.0)}"
+        f":TP={CONFIG.get('target_true_peak', -1.0)}"
+        f":LRA={CONFIG.get('target_lra', 11.0)}"
+    )
+
+
 def assemble_video(input_video, tts_segments, work_dir, output_path):
     """组装最终视频"""
     if not tts_segments:
@@ -248,8 +264,8 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
 
     if ducking_mode == "sidechaincompress":
         filter_complex = (
-            "[0:a]aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11[orig];"
-            "[1:a]aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[narr];"
+            "[0:a]aresample=48000[orig];"
+            "[1:a]aresample=48000[narr];"
             f"[orig][narr]sidechaincompress="
             f"threshold={CONFIG['ducking_threshold']}:ratio={CONFIG['ducking_ratio']}"
             f":attack={CONFIG['ducking_attack']}:release={CONFIG['ducking_release']}"
@@ -259,9 +275,10 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
             f":weights=1 {CONFIG['ducking_narr_weight']}:normalize=0[aout]"
         )
     elif ducking_mode == "none":
+        narr_vol = CONFIG.get("ducking_narr_weight", 1.5)
         filter_complex = (
-            "[0:a]aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11[orig];"
-            "[1:a]aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[narr];"
+            "[0:a]aresample=48000[orig];"
+            f"[1:a]volume={narr_vol},aresample=48000[narr];"
             "[orig][narr]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
         )
     elif has_overlaps and has_quiet:
@@ -350,6 +367,14 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
         )
 
     # 对于超长 volume 表达式（多段解说），使用 -filter_complex_script 避免命令行溢出
+    # 末端整体响度归一：ducking 只管相对平衡，这一步统一成片绝对响度
+    aout_label = "[aout]"
+    final_ln = final_loudnorm_filter()
+    if final_ln:
+        filter_complex += f";[aout]{final_ln}[aoutln]"
+        aout_label = "[aoutln]"
+        log(f"成片响度归一: {final_ln}")
+
     filter_complex_bytes = filter_complex.encode('utf-8')
     if len(filter_complex_bytes) > 8000:
         fc_script = Path(work_dir) / ".filter_complex.txt"
@@ -360,7 +385,7 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
             "-i", str(input_video),
             "-i", str(narration_wav),
             "-filter_complex_script", str(fc_script),
-            "-map", "0:v", "-map", "[aout]",
+            "-map", "0:v", "-map", aout_label,
         ]
     else:
         cmd = [
@@ -368,7 +393,7 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
             "-i", str(input_video),
             "-i", str(narration_wav),
             "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", "[aout]",
+            "-map", "0:v", "-map", aout_label,
         ]
 
     if CONFIG.get("burn_subtitles", False):

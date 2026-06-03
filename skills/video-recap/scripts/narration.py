@@ -124,7 +124,7 @@ def _normalise_narration_segment(seg, scenes_analysis=None):
         "end": round(end, 2),
         "narration": text,
         "pause_after_ms": pause,
-        "overlaps_speech": bool(seg.get("overlaps_speech", False)),
+        "overlaps_speech": bool(seg.get("overlaps_speech", True)),
     }
     for optional_key in ("source_start", "source_end", "source_clip_id"):
         if optional_key in seg:
@@ -329,10 +329,45 @@ def lint_narration(narration, scenes_analysis=None, *, clip_plan=None, mode="ful
                 previous_index=prev["index"], previous_end=prev["end"], start=curr["start"], end=curr["end"],
             ))
 
+    # Density / continuous-bed style check (full mode only; cut-mode density must be
+    # measured on the mapped output timeline, not the source timestamps used here).
+    metrics = {}
+    if mode == "full" and len(sorted_segments) >= 2:
+        span = sorted_segments[-1]["end"] - sorted_segments[0]["start"]
+        gaps = [curr["start"] - prev["end"] for prev, curr in zip(sorted_segments, sorted_segments[1:])]
+        max_gap = max(gaps) if gaps else 0.0
+        spm = len(sorted_segments) / (span / 60) if span > 0 else 0.0
+        min_spm = CONFIG.get("min_segments_per_minute", 6.24)
+        target_spm = CONFIG.get("target_segments_per_minute", 9.6)
+        max_gap_limit = CONFIG.get("max_narration_gap_seconds", 11.0)
+        metrics = {
+            "segment_count": len(sorted_segments),
+            "timeline_span_seconds": round(span, 2),
+            "segments_per_minute": round(spm, 2),
+            "max_gap_seconds": round(max_gap, 2),
+            "target_segments_per_minute": target_spm,
+            "min_segments_per_minute": min_spm,
+            "max_gap_limit_seconds": max_gap_limit,
+        }
+        if spm and spm < min_spm:
+            warnings.append(_lint_issue(
+                "warning", None, "low_density",
+                "Narration density is below the continuous-bed target; add more short beats",
+                segments_per_minute=round(spm, 2), min_segments_per_minute=min_spm,
+                target_segments_per_minute=target_spm,
+            ))
+        if max_gap > max_gap_limit:
+            warnings.append(_lint_issue(
+                "warning", None, "long_gap",
+                "A gap between narration beats exceeds the continuous-bed maximum",
+                max_gap_seconds=round(max_gap, 2), max_gap_limit_seconds=max_gap_limit,
+            ))
+
     report = {
         "ok": not errors,
         "error_count": len(errors),
         "warning_count": len(warnings),
+        "metrics": metrics,
         "errors": errors,
         "warnings": warnings,
     }
@@ -538,9 +573,14 @@ def _quiet_overlap_seconds(start, end, quiet_windows):
 def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_duration, work_dir, style="纪录片"):
     """Write a compact brief that tells the agent exactly how to author recap artifacts."""
     effective_rate = CONFIG["speech_rate"] * CONFIG["speech_safety_margin"]
-    breath_sec = CONFIG.get("breath_ms", 600) / 1000
+    breath_sec = CONFIG.get("breath_ms", 250) / 1000
+    target_pause_ms = CONFIG.get("breath_ms", 250)
+    target_spm = CONFIG.get("target_segments_per_minute", 9.6)
+    min_spm = CONFIG.get("min_segments_per_minute", 6.24)
+    max_gap = CONFIG.get("max_narration_gap_seconds", 11.0)
     edit_mode = CONFIG.get("edit_mode", "full")
     target_duration = CONFIG.get("target_duration") or "(not set)"
+    target_count = max(1, round(video_duration / 60 * target_spm))
     mimo_overview_path = Path(work_dir) / "mimo_video_overview.json"
     lines = [
         "# Agent Narration Brief",
@@ -552,7 +592,10 @@ def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_durati
         f"- Edit mode: {edit_mode}",
         f"- Source video duration: {video_duration:.1f}s",
         f"- Target duration (cut mode): {target_duration}",
-        f"- Effective speech budget: {effective_rate:.2f} Chinese chars/sec after {breath_sec:.1f}s pause allowance",
+        f"- Effective speech budget: {effective_rate:.2f} Chinese chars/sec after {breath_sec:.2f}s pause allowance",
+        f"- Narration density target: ~{target_spm:.1f} segments/min (minimum {min_spm:.1f}); no gap longer than {max_gap:.0f}s",
+        f"- Aim for roughly {target_count} short beats across the timeline, kept continuous over a ducked original-audio bed",
+        f"- Default pause between beats: {target_pause_ms}ms",
         f"- Context: {CONFIG.get('context_info') or '(none)'}",
         "",
     ]
@@ -593,7 +636,7 @@ def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_durati
             "",
             "```json",
             "[",
-            "  {\"start\": 14.0, \"end\": 21.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 600, \"overlaps_speech\": false}",
+            "  {\"start\": 14.0, \"end\": 19.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 250, \"overlaps_speech\": true}",
             "]",
             "```",
         ])
@@ -603,22 +646,23 @@ def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_durati
             "",
             "```json",
             "[",
-            "  {\"start\": 5.0, \"end\": 12.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 600, \"overlaps_speech\": false}",
+            "  {\"start\": 5.0, \"end\": 10.0, \"narration\": \"解说文本。\", \"pause_after_ms\": 250, \"overlaps_speech\": true}",
             "]",
             "```",
         ])
 
     lines.extend([
         "",
-        "## Writing rules",
+        "## Writing rules (dense continuous-bed recap style)",
         "",
-        "1. Do not describe what the viewer can already see; explain intent, stakes, subtext, and story logic.",
-        "2. Prefer quiet windows. Use `overlaps_speech=true` only when narration intentionally overlaps original dialogue.",
-        "3. Keep each line under its max character budget; shorter is safer for edge-tts.",
-        "4. Preserve original audio moments that carry important dialogue or atmosphere.",
-        "5. In cut mode, select clips for plot causality, key dialogue, reveals, and emotional turns; avoid filler and repeated shots.",
+        "1. Narrate continuously across the whole timeline as short punchy beats, keeping the original audio alive underneath as a ducked bed.",
+        f"2. Hit the density target: ~{target_spm:.1f} beats/min (at least {min_spm:.1f}); never leave a gap longer than {max_gap:.0f}s without narration.",
+        "3. Default `overlaps_speech` to true. The CLI auto-marks a beat as non-overlapping only when it actually lands inside a real silent window.",
+        "4. Keep each beat short: roughly one short sentence (1-2 subtitle lines). Shorter is safer for TTS and reads better.",
+        "5. Do not describe what the viewer can already see; explain intent, stakes, subtext, relationships, and story logic.",
         "6. Keep timing visually local: if one line spans many frame-fact timestamps, split it or tighten start/end around the pictured beat.",
-        "7. After writing, run: `python3 skills/video-recap/scripts/video_recap.py <video> --resume <work_dir>`.",
+        "7. In cut mode, select clips for plot causality, key dialogue, reveals, and emotional turns; avoid filler and repeated shots.",
+        "8. After writing, run: `python3 skills/video-recap/scripts/video_recap.py <video> --resume <work_dir>`.",
         "",
         "## Scene timing guide",
         "",
