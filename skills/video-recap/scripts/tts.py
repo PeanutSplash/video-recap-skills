@@ -325,7 +325,10 @@ def _tts_edge(text, output_path, rate="+0%", pitch="+0Hz"):
     # 转为 WAV + highpass 去除低频隆隆声
     cmd = ["ffmpeg", "-y", "-i", mp3_path,
            "-af", "highpass=f=80", "-ar", "44100", "-ac", "1", str(output_path)]
-    run_cmd(cmd)
+    conv = run_cmd(cmd)
+    if conv.returncode != 0:
+        # 转换失败时保留 mp3 源，并向上抛错让调用方重试看到真实原因
+        raise RuntimeError(f"Edge-TTS mp3 转 WAV 失败: {conv.stderr}")
     os.remove(mp3_path)
 
 

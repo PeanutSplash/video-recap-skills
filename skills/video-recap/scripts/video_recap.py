@@ -46,10 +46,10 @@ def main():
     parser.add_argument("--output", "-o", help="输出目录 (默认: 视频所在目录/output)")
     parser.add_argument("--step", choices=["extract", "detect", "asr", "analyze", "script", "tts", "assemble"],
                         help="仅执行某步骤；script 只验证 Agent 写好的 narration.json")
-    parser.add_argument("--style", default="纪录片",
+    parser.add_argument("--style", default=None,
                         choices=["短剧", "电视剧", "电影", "纪录片", "科普视频"],
                         help="解说风格 (默认: 纪录片)")
-    parser.add_argument("--scene-threshold", type=float, default=0.1,
+    parser.add_argument("--scene-threshold", type=float, default=None,
                         help="场景检测阈值 0.0-1.0 (默认: 0.1, 对应 scdet=10)")
     parser.add_argument("--skip-asr", action="store_true",
                         help="跳过 ASR 转录")
@@ -57,14 +57,14 @@ def main():
                         help="从已有的工作目录继续")
     parser.add_argument("--tts", choices=["auto", "edge-tts", "mimo-tts"],
                         default=None, help="TTS 引擎 (默认: TTS_ENGINE 或 auto；auto 有 MiMo key 时优先 mimo-tts)")
-    parser.add_argument("--fps", type=float, default=0,
+    parser.add_argument("--fps", type=float, default=None,
                         help="帧提取 fps (默认: 自动，≤60s→2fps, ≤5min→1.5fps, >5min→1fps)")
     parser.add_argument("--burn-subtitles", action="store_true",
                         help="烧录字幕到视频（会增加处理时间）")
     parser.add_argument("--ducking", choices=["sidechaincompress", "fixed", "none"],
                         default=None,
                         help=f"音频 ducking 模式；默认使用配置值 {CONFIG['ducking_mode']}")
-    parser.add_argument("--context", type=str, default="",
+    parser.add_argument("--context", type=str, default=None,
                         help="额外上下文（节目名、角色名等）")
     parser.add_argument("--model", type=str, default=None,
                         help="覆盖 VLM 模型名 (默认: OPENAI_MODEL 或 doubao-seed-2-0-lite-260428)")
@@ -109,9 +109,16 @@ def main():
     if args.tts is not None:
         CONFIG["tts_engine"] = args.tts
         CONFIG["tts_engine_source"] = "cli"
-    CONFIG["fps"] = args.fps
+    if args.fps is not None:
+        CONFIG["fps"] = args.fps
+        CONFIG["fps_source"] = "cli"
     CONFIG["burn_subtitles"] = args.burn_subtitles
-    CONFIG["context_info"] = args.context
+    if args.context is not None:
+        CONFIG["context_info"] = args.context
+        CONFIG["context_info_source"] = "cli"
+    if args.style is not None:
+        CONFIG["style"] = args.style
+        CONFIG["style_source"] = "cli"
     if args.api_provider:
         _apply_api_provider(args.api_provider)
     if args.mimo_api_url:
@@ -153,14 +160,18 @@ def main():
         CONFIG["allow_partial_tts"] = True
     if args.scene_threshold is not None:
         CONFIG["scene_threshold"] = args.scene_threshold
+        CONFIG["scene_threshold_source"] = "cli"
     if args.ducking:
         CONFIG["ducking_mode"] = args.ducking
     if args.edit_mode:
         CONFIG["edit_mode"] = args.edit_mode
+        CONFIG["edit_mode_source"] = "cli"
     if args.target_duration is not None:
         CONFIG["target_duration"] = args.target_duration
+        CONFIG["target_duration_source"] = "cli"
     if args.clip_padding is not None:
         CONFIG["clip_padding"] = max(0.0, args.clip_padding)
+        CONFIG["clip_padding_source"] = "cli"
     if args.allow_clip_overlap:
         CONFIG["allow_clip_overlap"] = True
 

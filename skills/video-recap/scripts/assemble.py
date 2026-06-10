@@ -454,13 +454,17 @@ def _build_timed_narration(tts_segments, output_wav, video_duration, work_dir):
     buffer = bytearray(total_samples * 2)
     last_written_end = 0  # 追踪已写入位置，防止重叠
     prev_pause_samples = 0  # 前一段的 pause_after_ms，控制段间间隔
+    skipped_count = 0  # 因 WAV 缺失/损坏/重采样失败而被跳过的段数
 
     for seg in tts_segments:
         wav_path = seg["audio_path"]
         seg_pause_ms = seg.get("pause_after_ms", CONFIG.get("breath_ms", 600))
 
         if not os.path.exists(wav_path):
+            seg["actual_place_start"] = seg["start"]
+            seg["actual_place_end"] = seg["start"]
             prev_pause_samples = int(seg_pause_ms * sample_rate / 1000)
+            skipped_count += 1
             continue
 
         # WAV 格式验证 + 采样率检查（合并为一次 wave.open）
@@ -472,13 +476,19 @@ def _build_timed_narration(tts_segments, output_wav, video_duration, work_dir):
                 wf_sampwidth = wf_check.getsampwidth()
                 if wf_sampwidth != 2 or wf_channels != 1:
                     log(f"  跳过非标准 WAV: {wav_path} (channels={wf_channels}, sampwidth={wf_sampwidth}), 需要 mono 16-bit")
+                    seg["actual_place_start"] = seg["start"]
+                    seg["actual_place_end"] = seg["start"]
                     prev_pause_samples = int(seg_pause_ms * sample_rate / 1000)
+                    skipped_count += 1
                     continue
                 if wf_check.getframerate() != sample_rate:
                     _do_resample = True
         except Exception as e:
             log(f"  WAV 读取失败: {wav_path}: {e}")
+            seg["actual_place_start"] = seg["start"]
+            seg["actual_place_end"] = seg["start"]
             prev_pause_samples = int(seg_pause_ms * sample_rate / 1000)
+            skipped_count += 1
             continue
 
         tts_rate_offset = seg.get("tts_rate_offset", 0.0)
@@ -511,9 +521,16 @@ def _build_timed_narration(tts_segments, output_wav, video_duration, work_dir):
             _do_resample = False
         if _do_resample:
             tmp_path = str(Path(work_dir) / f"_rs_{seg.get('index', 0)}.wav")
-            run_cmd(["ffmpeg", "-y", "-i", wav_path,
-                     "-ar", str(sample_rate), "-ac", "1",
-                     "-acodec", "pcm_s16le", tmp_path])
+            rs_result = run_cmd(["ffmpeg", "-y", "-i", wav_path,
+                                 "-ar", str(sample_rate), "-ac", "1",
+                                 "-acodec", "pcm_s16le", tmp_path])
+            if rs_result.returncode != 0 or not os.path.exists(tmp_path):
+                log(f"  重采样失败，跳过本段: {wav_path}: {rs_result.stderr}")
+                seg["actual_place_start"] = seg["start"]
+                seg["actual_place_end"] = seg["start"]
+                prev_pause_samples = int(seg_pause_ms * sample_rate / 1000)
+                skipped_count += 1
+                continue
             wav_path = tmp_path
 
         with wave.open(wav_path, "rb") as wf:
@@ -578,5 +595,8 @@ def _build_timed_narration(tts_segments, output_wav, video_duration, work_dir):
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(bytes(buffer))
+
+    if tts_segments and skipped_count >= len(tts_segments):
+        log(f"  ⚠️ 严重警告: 全部 {len(tts_segments)} 段解说均被跳过（WAV 缺失/损坏/重采样失败），成片将没有解说音频")
 
     log(f"解说音轨: {video_duration:.1f}s, {len(tts_segments)} 段")

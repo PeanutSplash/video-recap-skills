@@ -135,7 +135,7 @@ def analyze_scenes(scenes, frames, work_dir):
             resp = api_call(payload)
             try:
                 msg = resp["choices"][0]["message"]
-                raw_response = msg.get("content", "") or msg.get("reasoning_content", "")
+                raw_response = (msg.get("content") or msg.get("reasoning_content") or "")
             except (KeyError, IndexError):
                 log(f"VLM 返回异常: {json.dumps(resp, ensure_ascii=False)[:200]}")
 
@@ -145,7 +145,7 @@ def analyze_scenes(scenes, frames, work_dir):
             if attempt < 2:
                 log(f"  场景 {i+1} VLM 返回空，重试 ({attempt+2}/3)...")
                 retry_parts = content_parts[:-1]
-                retry_parts.append({"type": "text", "text": vlm_prompt + "\n请务必按格式输出，不要留空。"})
+                retry_parts.append({"type": "text", "text": frame_ts_text + "\n\n" + vlm_prompt + "\n请务必按格式输出，不要留空。"})
                 payload = {
                     "model": CONFIG["vlm_model"],
                     "messages": [{"role": "user", "content": retry_parts}],
@@ -293,6 +293,45 @@ def mimo_video_settings_fingerprint():
     }
 
 
+def _mimo_chunk_cache_key(chunk):
+    """Stable identifier for a MiMo chunk (index + scene span) for partial-cache reuse."""
+    return (
+        f"{chunk['chunk_id']}|{chunk['scene_id']}|"
+        f"{float(chunk['start']):.3f}-{float(chunk['end']):.3f}"
+    )
+
+
+def _load_mimo_partial(partial_path):
+    """Load the internal partial chunk cache, keyed by chunk identifier.
+
+    Returns {} when missing/unreadable or when the settings fingerprint differs,
+    so a settings change invalidates already-cached chunks.
+    """
+    if not partial_path.exists():
+        return {}
+    try:
+        partial = json.loads(partial_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(partial, dict):
+        return {}
+    if partial.get("settings") != mimo_video_settings_fingerprint():
+        return {}
+    done = partial.get("chunks")
+    if not isinstance(done, dict):
+        return {}
+    return done
+
+
+def _save_mimo_partial(partial_path, done):
+    """Persist completed chunk results incrementally so paid chunks survive a mid-loop failure."""
+    payload = {
+        "settings": mimo_video_settings_fingerprint(),
+        "chunks": done,
+    }
+    partial_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _analyze_mimo_video_chunk(chunk_path, chunk):
     video_url = _video_data_url(chunk_path)
     if not video_url:
@@ -343,9 +382,22 @@ def analyze_video_overview(video_path, work_dir, scenes=None):
     chunks_dir = work_dir / "mimo_video_chunks"
     chunks_dir.mkdir(exist_ok=True)
 
+    # 增量缓存：已完成的分片先落盘，避免一段失败时丢弃所有已付费分片
+    partial_path = work_dir / "mimo_video_overview.partial.json"
+    done = _load_mimo_partial(partial_path)
+
     log(f"MiMo 视频理解：按 ffmpeg scene 分片分析 {len(chunks)} 段...")
     chunk_results = []
     for chunk in chunks:
+        cache_key = _mimo_chunk_cache_key(chunk)
+        cached = done.get(cache_key)
+        if cached is not None:
+            log(
+                f"  MiMo 分片 {chunk['chunk_id'] + 1}/{len(chunks)}: "
+                f"{chunk['start']:.1f}-{chunk['end']:.1f}s（命中增量缓存，跳过）"
+            )
+            chunk_results.append(cached)
+            continue
         chunk_path = chunks_dir / (
             f"chunk_{chunk['chunk_id']:03d}_scene_{chunk['scene_id']}_"
             f"{chunk['start']:.2f}-{chunk['end']:.2f}.mp4"
@@ -355,7 +407,10 @@ def analyze_video_overview(video_path, work_dir, scenes=None):
             f"  MiMo 分片 {chunk['chunk_id'] + 1}/{len(chunks)}: "
             f"{chunk['start']:.1f}-{chunk['end']:.1f}s"
         )
-        chunk_results.append(_analyze_mimo_video_chunk(chunk_path, chunk))
+        chunk_result = _analyze_mimo_video_chunk(chunk_path, chunk)
+        chunk_results.append(chunk_result)
+        done[cache_key] = chunk_result
+        _save_mimo_partial(partial_path, done)
 
     content = "\n\n".join(
         f"### 分片 {item['chunk_id'] + 1} "
@@ -377,5 +432,10 @@ def analyze_video_overview(video_path, work_dir, scenes=None):
     }
     overview_path = work_dir / "mimo_video_overview.json"
     overview_path.write_text(json.dumps(overview, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 所有分片完成后清理增量缓存，保持 work_dir 仅有规范产物
+    try:
+        partial_path.unlink()
+    except OSError:
+        pass
     log(f"MiMo 分片视频概览完成: {overview_path}")
     return overview

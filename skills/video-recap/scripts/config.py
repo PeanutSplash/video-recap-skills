@@ -158,6 +158,7 @@ CONFIG = {
     # 使 overlaps_speech/安静窗口判断失真。代价是更多 ASR 调用；ASR 慢时可调大。
     "asr_segment_seconds": env_float("ASR_SEGMENT_SECONDS", 30.0, minimum=5.0),
     "scene_threshold": 0.1,
+    "scene_threshold_source": "default",
     "tts_engine": os.environ.get("TTS_ENGINE", "auto"),  # auto | edge-tts | mimo-tts
     "tts_engine_source": "env" if os.environ.get("TTS_ENGINE") else "default",
     "edge_tts_voice": "zh-CN-YunxiNeural",
@@ -214,13 +215,23 @@ CONFIG = {
     "quiet_overlap_min_ratio": 0.8,  # 解说段至少多少比例落在安静窗口内才标记为非对白重叠
     "visual_beat_max_seconds": 18.0,  # 单段解说超过该时长且跨多个帧锚点时给 lint 提醒
     "visual_beat_max_facts": 3,  # 单段解说最多建议覆盖的 frame_facts 锚点数量
+    "asr_chunk_min_chars": env_int("ASR_CHUNK_MIN_CHARS", 500, minimum=1),  # brief 中 ASR 写作分块最小字数/词数
+    "asr_chunk_max_chars": env_int("ASR_CHUNK_MAX_CHARS", 800, minimum=1),  # brief 中 ASR 写作分块最大字数/词数
     "speech_ducking_volume": 0.2,    # 解说与对白重叠时原声音量
     "silence_noise_threshold": "-25dB",  # ffmpeg silencedetect 噪声阈值
     "silence_min_duration": 0.3,     # 静音最短持续秒数
     "quiet_window_min": 1.0,         # 可放解说的安静窗口最短秒数
     "silence_merge_gap": 0.5,        # 相邻静音段间隔<此值时合并
     "scene_merge_min": 4.0,         # 场景合并最短时长，<此值的场景合并到相邻场景
+    "scene_junk_filter": env_bool("SCENE_JUNK_FILTER", True),  # 过滤连续黑/白帧无效过渡场景
+    "scene_junk_dark_luma": env_float("SCENE_JUNK_DARK_LUMA", 8.0, minimum=0.0),
+    "scene_junk_bright_luma": env_float("SCENE_JUNK_BRIGHT_LUMA", 245.0, minimum=0.0),
+    "scene_junk_pixel_ratio": env_float("SCENE_JUNK_PIXEL_RATIO", 0.995, minimum=0.0),
     "context_info": "",              # 额外上下文（节目名、角色名等）
+    "context_info_source": "default",
+    "fps_source": "default",
+    "style": "纪录片",               # 解说风格（resume 时随 run_settings 持久化/恢复）
+    "style_source": "default",
     "tts_dynamic_params": True,  # 启用动态语速调节
     "vlm_workers": env_int("VLM_WORKERS", 8, minimum=1),  # VLM 并行分析线程数
     "tts_workers": env_int("TTS_WORKERS", 4, minimum=1),  # TTS 并行合成线程数
@@ -228,8 +239,11 @@ CONFIG = {
     "tts_retries": env_int("TTS_RETRIES", 3, minimum=1),  # 单段 TTS 失败重试次数
     "allow_partial_tts": env_bool("ALLOW_PARTIAL_TTS", False),
     "edit_mode": os.environ.get("EDIT_MODE", "full"),  # full | cut
+    "edit_mode_source": "env" if os.environ.get("EDIT_MODE") else "default",
     "target_duration": os.environ.get("TARGET_DURATION", ""),  # cut 模式目标成片时长，如 10m
+    "target_duration_source": "env" if os.environ.get("TARGET_DURATION") else "default",
     "clip_padding": env_float("CLIP_PADDING", 0.0, minimum=0.0),  # cut 模式片段两端扩展秒数
+    "clip_padding_source": "env" if os.environ.get("CLIP_PADDING") else "default",
     "allow_clip_overlap": env_bool("ALLOW_CLIP_OVERLAP", False),  # cut 模式是否允许重复/重叠使用原片
     "burn_subtitles": False,  # 烧录字幕到视频（需要重编码）
     "force_video_reencode": env_bool("FORCE_VIDEO_REENCODE", False),  # 组装时重编码视频，修复部分容器时间戳问题

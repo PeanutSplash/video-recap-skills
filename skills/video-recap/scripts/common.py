@@ -1,4 +1,6 @@
 import json
+import hashlib
+import os
 import re
 import subprocess
 import time
@@ -42,6 +44,55 @@ def get_video_duration(video_path):
         return float(result.stdout.strip())
     except (TypeError, ValueError):
         return 0.0
+
+
+def stable_json_dumps(value):
+    """Serialize values deterministically for non-secret cache fingerprints."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def stable_hash(value):
+    """Return an md5 digest for deterministic JSON-serializable values."""
+    return hashlib.md5(stable_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def file_fingerprint(path, sample_bytes=65536):
+    """Return a fast content fingerprint based on file size plus head/tail bytes.
+
+    This intentionally avoids mtime/path so copied videos or JSON artifacts can
+    be reused when their bytes are identical, while changed bytes invalidate the
+    cache even if timestamps are misleading.
+    """
+    path = os.fspath(path)
+    size = os.path.getsize(path)
+    h = hashlib.md5()
+    h.update(str(size).encode("ascii"))
+    h.update(b"\0")
+    with open(path, "rb") as f:
+        head = f.read(sample_bytes)
+        if size > sample_bytes:
+            f.seek(max(0, size - sample_bytes))
+            tail = f.read(sample_bytes)
+        else:
+            tail = b""
+    h.update(head)
+    h.update(b"\0")
+    h.update(tail)
+    return h.hexdigest()
+
+
+def video_fingerprint(video_path):
+    """Fast video content fingerprint used as the root pipeline asset print."""
+    return file_fingerprint(video_path)
+
+
+def step_cache_key(video_path, step_name, params_fingerprint=""):
+    """Build a cache key from video content, step name and step parameters."""
+    params_digest = params_fingerprint
+    if not isinstance(params_digest, str):
+        params_digest = stable_hash(params_digest)
+    payload = f"{video_fingerprint(video_path)}_{step_name}_{params_digest}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
 def _retry_after_seconds(value, fallback):

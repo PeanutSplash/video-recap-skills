@@ -4,10 +4,19 @@ import shutil
 import shlex
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import CONFIG
-from common import log, api_call, get_video_duration, run_cmd
+from common import (
+    api_call,
+    file_fingerprint,
+    get_video_duration,
+    log,
+    run_cmd,
+    stable_hash,
+    video_fingerprint,
+)
 from extract import extract_frames
 from detect import detect_scenes, detect_silence_periods
 from asr import transcribe_audio
@@ -29,16 +38,164 @@ from edit import (
     parse_duration_seconds,
 )
 
-# ── Prerequisites ─────────────────────────────────────────────────────
+# ── Workflow state / prerequisites ────────────────────────────────────
 
-def _step_done(work_dir, step_name):
+STATE_SCHEMA_VERSION = 1
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _workflow_state_path(work_dir):
+    return work_dir / "workflow_state.json"
+
+
+def _load_workflow_state(work_dir):
+    path = _workflow_state_path(work_dir)
+    if not path.exists():
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"警告: workflow_state.json 读取失败，重建状态: {exc}")
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_workflow_state(work_dir, state):
+    path = _workflow_state_path(work_dir)
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _ensure_workflow_state(work_dir):
+    state = _load_workflow_state(work_dir)
+    if not state:
+        state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "started_at": _utc_now(),
+            "steps": {},
+        }
+    state.setdefault("schema_version", STATE_SCHEMA_VERSION)
+    state.setdefault("started_at", _utc_now())
+    state.setdefault("steps", {})
+    return state
+
+
+def _clear_legacy_step_markers(work_dir):
+    for marker in Path(work_dir).glob(".step_*.done"):
+        marker.unlink(missing_ok=True)
+
+
+def _init_workflow_state(work_dir, input_video):
+    """Initialize workflow_state.json and invalidate stale markers on video changes."""
+    state = _ensure_workflow_state(work_dir)
+    try:
+        current_fp = video_fingerprint(input_video)
+    except OSError as exc:
+        log(f"警告: 无法计算视频内容指纹: {exc}")
+        current_fp = None
+    previous_fp = state.get("video_fingerprint")
+    if previous_fp and current_fp and previous_fp != current_fp:
+        state["invalidated_at"] = _utc_now()
+        state["previous_video_fingerprint"] = previous_fp
+        state["steps"] = {}
+        _clear_legacy_step_markers(work_dir)
+        log("检测到输入视频内容指纹变化，已清空旧步骤状态")
+    state["input_video"] = str(input_video)
+    if current_fp:
+        state["video_fingerprint"] = current_fp
+    _write_workflow_state(work_dir, state)
+    return state
+
+
+def _step_state_entry(work_dir, step_name):
+    return (_load_workflow_state(work_dir).get("steps") or {}).get(step_name)
+
+
+def _set_step_state(work_dir, step_name, status, *, progress=None, params=None, err_msg=None):
+    state = _ensure_workflow_state(work_dir)
+    steps = state.setdefault("steps", {})
+    now = _utc_now()
+    entry = dict(steps.get(step_name) or {})
+    entry["status"] = status
+    if params is not None:
+        entry["params"] = params
+        entry["params_fingerprint"] = stable_hash(params)
+    if status == "processing":
+        entry["started_at"] = now
+        entry.pop("completed_at", None)
+        entry.pop("elapsed_s", None)
+        entry.pop("err_msg", None)
+        entry["progress"] = 0 if progress is None else progress
+    elif status == "done":
+        entry.setdefault("started_at", now)
+        entry["completed_at"] = now
+        try:
+            started = datetime.fromisoformat(entry["started_at"].replace("Z", "+00:00"))
+            completed = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            entry["elapsed_s"] = round((completed - started).total_seconds(), 2)
+        except (TypeError, ValueError):
+            pass
+        entry["progress"] = 100
+        entry.pop("err_msg", None)
+    elif status == "error":
+        entry.setdefault("started_at", now)
+        entry["completed_at"] = now
+        entry["progress"] = progress if progress is not None else entry.get("progress", 0)
+        entry["err_msg"] = str(err_msg or "")
+    elif status == "wait":
+        entry.setdefault("progress", 0)
+        if err_msg:
+            entry["err_msg"] = str(err_msg)
+    steps[step_name] = entry
+    state["updated_at"] = now
+    _write_workflow_state(work_dir, state)
+    return entry
+
+
+def _step_started(work_dir, step_name, params=None):
+    return _set_step_state(work_dir, step_name, "processing", params=params)
+
+
+def _step_failed(work_dir, step_name, exc):
+    return _set_step_state(work_dir, step_name, "error", err_msg=exc)
+
+
+def _run_stateful_step(work_dir, step_name, func, *, params=None):
+    _step_started(work_dir, step_name, params=params)
+    try:
+        result = func()
+    except Exception as exc:
+        _step_failed(work_dir, step_name, exc)
+        raise
+    _step_done(work_dir, step_name, params=params)
+    return result
+
+
+def _step_done(work_dir, step_name, params=None):
     """标记步骤完成"""
     (work_dir / f".step_{step_name}.done").write_text("ok")
+    _set_step_state(work_dir, step_name, "done", params=params)
 
 
-def _is_step_done(work_dir, step_name):
+def _is_step_done(work_dir, step_name, params=None):
     """检查步骤是否已完成"""
-    return (work_dir / f".step_{step_name}.done").exists()
+    entry = _step_state_entry(work_dir, step_name)
+    if entry:
+        if entry.get("status") != "done":
+            return False
+        if params is not None and entry.get("params_fingerprint") != stable_hash(params):
+            return False
+        return True
+    legacy_marker = work_dir / f".step_{step_name}.done"
+    if legacy_marker.exists():
+        _set_step_state(work_dir, step_name, "done", params=params)
+        return True
+    return False
 
 
 def _command_available(command):
@@ -107,6 +264,13 @@ def _persist_run_settings(work_dir):
         "clip_padding": CONFIG.get("clip_padding", 0.0),
         "allow_clip_overlap": CONFIG.get("allow_clip_overlap", False),
         "burn_subtitles": CONFIG.get("burn_subtitles", False),
+        # 解说/检测语义参数：resume 时若不显式重传，会被这里持久化的值恢复，
+        # 避免 VLM/detect 因指纹不匹配而重跑。fps 持久化原始值（0=自动），
+        # 同一视频在 resume 时会确定性地解析出相同的实际 fps。
+        "context_info": CONFIG.get("context_info", ""),
+        "fps": CONFIG.get("fps", 0),
+        "scene_threshold": CONFIG.get("scene_threshold", 0.1),
+        "style": CONFIG.get("style", "纪录片"),
         "mimo_api_url": CONFIG.get("mimo_api_url"),
         "mimo_video_api_url": CONFIG.get("mimo_video_api_url"),
         "mimo_tts_api_url": CONFIG.get("mimo_tts_api_url"),
@@ -139,6 +303,7 @@ def _load_run_settings(work_dir):
     for key in (
         "api_provider", "api_url", "vlm_model", "tts_engine",
         "edit_mode", "target_duration", "clip_padding", "allow_clip_overlap", "burn_subtitles",
+        "context_info", "fps", "scene_threshold", "style",
         "mimo_api_url", "mimo_video_api_url", "mimo_tts_api_url", "mimo_model", "mimo_video_model",
         "mimo_tts_model", "mimo_tts_voice", "mimo_tts_style",
         "mimo_video_overview", "mimo_video_fps", "mimo_media_resolution",
@@ -225,6 +390,24 @@ def _resume_command(cli_path, video_path, work_dir):
         parts.append("--burn-subtitles")
     if CONFIG.get("tts_engine") and CONFIG.get("tts_engine") != "auto":
         parts.extend(["--tts", str(CONFIG["tts_engine"])])
+    context_info = CONFIG.get("context_info") or ""
+    if context_info:
+        parts.extend(["--context", str(context_info)])
+    style = CONFIG.get("style", "纪录片")
+    if style and style != "纪录片":
+        parts.extend(["--style", str(style)])
+    try:
+        scene_threshold = float(CONFIG.get("scene_threshold", 0.1))
+    except (TypeError, ValueError):
+        scene_threshold = 0.1
+    if scene_threshold != 0.1:
+        parts.extend(["--scene-threshold", f"{scene_threshold:g}"])
+    try:
+        fps = float(CONFIG.get("fps", 0) or 0)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if fps > 0:
+        parts.extend(["--fps", f"{fps:g}"])
     return " ".join(shlex.quote(part) for part in parts)
 
 
@@ -262,6 +445,18 @@ def _annotate_cut_narration_overlap(narration, silence_periods):
 
 def _prepare_cut_mode_artifacts(video_path, work_dir, narration, *, validate_budget=True):
     """Validate clip_plan.json, build edited_source.mp4, and map narration to output time."""
+    params = _cut_edit_params(video_path, work_dir)
+    _step_started(work_dir, "edit", params=params)
+    try:
+        result = _prepare_cut_mode_artifacts_impl(video_path, work_dir, narration, validate_budget=validate_budget)
+    except Exception as exc:
+        _step_failed(work_dir, "edit", exc)
+        raise
+    _step_done(work_dir, "edit", params=params)
+    return result
+
+
+def _prepare_cut_mode_artifacts_impl(video_path, work_dir, narration, *, validate_budget=True):
     clip_plan_path = work_dir / "clip_plan.json"
     raw_plan = load_clip_plan(clip_plan_path)
     validated_plan = normalize_clip_plan(
@@ -299,7 +494,6 @@ def _prepare_cut_mode_artifacts(video_path, work_dir, narration, *, validate_bud
     mapped_path.write_text(json.dumps(mapped_narration, ensure_ascii=False, indent=2), encoding="utf-8")
     if mapped_path.stat().st_mtime < source_mtime:
         mapped_path.touch()
-    _step_done(work_dir, "edit")
     log(f"剪辑模式: {len(validated_plan['clips'])} 个片段 → {validated_plan['total_duration']:.1f}s")
     return edited_source, mapped_narration, validated_plan
 
@@ -333,6 +527,134 @@ def _artifact_current(output_path, source_paths):
     return output_path.stat().st_mtime >= max(path.stat().st_mtime for path in existing_sources)
 
 
+def _artifact_fingerprints(paths):
+    fingerprints = []
+    for index, raw in enumerate(paths or []):
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.exists():
+            continue
+        try:
+            fingerprints.append({"index": index, "fingerprint": file_fingerprint(path)})
+        except OSError as exc:
+            log(f"警告: 无法计算产物输入指纹 {path}: {exc}")
+    return fingerprints
+
+
+def _optional_file_fingerprint(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return file_fingerprint(path)
+    except OSError as exc:
+        log(f"警告: 无法计算文件指纹 {path}: {exc}")
+        return None
+
+
+def _script_step_params(work_dir, *, cut_mode, style):
+    return {
+        "edit_mode": CONFIG.get("edit_mode", "full"),
+        "style": style,
+        "target_duration": CONFIG.get("target_duration"),
+        "allow_clip_overlap": bool(CONFIG.get("allow_clip_overlap", False)),
+        "vlm_analysis_fingerprint": _optional_file_fingerprint(work_dir / "vlm_analysis.json"),
+        "asr_result_fingerprint": _optional_file_fingerprint(work_dir / "asr_result.json"),
+        "silence_periods_fingerprint": _optional_file_fingerprint(work_dir / "silence_periods.json"),
+        "narration_fingerprint": _optional_file_fingerprint(work_dir / "narration.json"),
+        "clip_plan_fingerprint": _optional_file_fingerprint(work_dir / "clip_plan.json") if cut_mode else None,
+    }
+
+
+def _extract_step_params():
+    return {"fps": CONFIG["fps"]}
+
+
+def _detect_step_params(scene_threshold):
+    return {
+        "scene_threshold": scene_threshold,
+        "scene_merge_min": CONFIG.get("scene_merge_min", 4.0),
+        "scene_junk_filter": CONFIG.get("scene_junk_filter", True),
+        "scene_junk_dark_luma": CONFIG.get("scene_junk_dark_luma", 8),
+        "scene_junk_bright_luma": CONFIG.get("scene_junk_bright_luma", 245),
+    }
+
+
+def _asr_step_params(skip_asr):
+    return {
+        "skip_asr": skip_asr,
+        "asr_segment_seconds": CONFIG.get("asr_segment_seconds"),
+        "asr_bin": CONFIG.get("asr_bin"),
+        "asr_model_dir": CONFIG.get("asr_model_dir"),
+    }
+
+
+def _cut_edit_params(video_path, work_dir):
+    return {
+        "input_video_fingerprint": video_fingerprint(video_path),
+        "clip_plan_fingerprint": _optional_file_fingerprint(work_dir / "clip_plan.json"),
+        "narration_fingerprint": _optional_file_fingerprint(work_dir / "narration.json"),
+        "target_duration": CONFIG.get("target_duration"),
+        "clip_padding": CONFIG.get("clip_padding", 0.0),
+        "allow_clip_overlap": bool(CONFIG.get("allow_clip_overlap", False)),
+    }
+
+
+def _tts_step_params(narration_artifact_path):
+    params = {
+        "narration_fingerprint": _optional_file_fingerprint(narration_artifact_path),
+        "requested_engine": CONFIG.get("tts_engine"),
+    }
+    try:
+        engine = resolve_tts_engine()
+        params["resolved_engine"] = engine
+        params["settings"] = tts_settings_fingerprint(engine)
+    except RuntimeError as exc:
+        params["resolve_error"] = str(exc)
+    return params
+
+
+def _synthesize_tts_stateful(work_dir, narration, narration_artifact_path):
+    params = _tts_step_params(narration_artifact_path)
+    _step_started(work_dir, "tts", params=params)
+    try:
+        tts_segments, engine_used = synthesize_tts(narration, work_dir)
+        (work_dir / "tts_meta.json").write_text(
+            json.dumps(
+                _tts_meta_payload(tts_segments, engine_used, [narration_artifact_path]),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _step_failed(work_dir, "tts", exc)
+        raise
+    _step_done(work_dir, "tts", params=params)
+    return tts_segments, engine_used
+
+
+def _assemble_step_params(input_video, source_paths):
+    return {
+        "input_video_fingerprint": video_fingerprint(input_video),
+        "source_fingerprints": _artifact_fingerprints(source_paths),
+        "settings": assembly_settings_fingerprint(),
+    }
+
+
+def _assemble_video_stateful(work_dir, input_video, tts_segments, output_path, source_paths):
+    params = _assemble_step_params(input_video, source_paths)
+    _step_started(work_dir, "assemble", params=params)
+    try:
+        assemble_video(input_video, tts_segments, work_dir, output_path)
+        _write_assemble_meta_with_sources(work_dir, input_video, source_paths)
+    except Exception as exc:
+        _step_failed(work_dir, "assemble", exc)
+        raise
+    _step_done(work_dir, "assemble", params=params)
+
+
 def _assemble_meta_path(work_dir):
     return work_dir / "assemble_meta.json"
 
@@ -340,6 +662,7 @@ def _assemble_meta_path(work_dir):
 def _write_assemble_meta(work_dir, input_video):
     meta = {
         "input_video": str(input_video),
+        "input_video_fingerprint": video_fingerprint(input_video),
         "settings": assembly_settings_fingerprint(),
     }
     _assemble_meta_path(work_dir).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -355,35 +678,66 @@ def _assemble_settings_current(work_dir, input_video):
     except (json.JSONDecodeError, OSError):
         return False
     return (
-        meta.get("input_video") == str(input_video)
+        (
+            meta.get("input_video_fingerprint") == video_fingerprint(input_video)
+            if meta.get("input_video_fingerprint")
+            else meta.get("input_video") == str(input_video)
+        )
         and meta.get("settings") == assembly_settings_fingerprint()
     )
 
 
 def _assemble_artifact_current(work_dir, output_path, source_paths, input_video):
-    return _artifact_current(output_path, source_paths) and _assemble_settings_current(work_dir, input_video)
+    if not output_path.exists() or not _assemble_settings_current(work_dir, input_video):
+        return False
+    try:
+        meta = json.loads(_assemble_meta_path(work_dir).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    meta_sources = meta.get("source_fingerprints")
+    if meta_sources is not None:
+        return meta_sources == _artifact_fingerprints(source_paths)
+    return _artifact_current(output_path, source_paths)
+
+
+def _write_assemble_meta_with_sources(work_dir, input_video, source_paths):
+    meta = _write_assemble_meta(work_dir, input_video)
+    meta["source_fingerprints"] = _artifact_fingerprints(source_paths)
+    _assemble_meta_path(work_dir).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
 
 
 def _clear_tts_cache(work_dir):
     shutil.rmtree(work_dir / "tts_segments", ignore_errors=True)
     for path in (work_dir / "tts_meta.json", work_dir / ".step_tts.done"):
         path.unlink(missing_ok=True)
+    _set_step_state(work_dir, "tts", "wait", err_msg="cache cleared")
+    _set_step_state(work_dir, "assemble", "wait", err_msg="tts cache cleared")
 
 
-def _tts_meta_payload(tts_segments, engine_used):
-    return {
+def _tts_meta_payload(tts_segments, engine_used, source_paths=None):
+    payload = {
         "segments": tts_segments,
         "engine": engine_used,
         "settings": tts_settings_fingerprint(engine_used),
     }
+    if source_paths is not None:
+        payload["source_fingerprints"] = _artifact_fingerprints(source_paths)
+    return payload
 
 
 def _tts_meta_current(tts_meta, narration_artifact_path):
-    if not _artifact_current(tts_meta, [narration_artifact_path]):
+    if not tts_meta.exists():
         return False
     try:
         tts_info = json.loads(tts_meta.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        return False
+    narration_sources = tts_info.get("source_fingerprints")
+    if narration_sources is not None:
+        if narration_sources != _artifact_fingerprints([narration_artifact_path]):
+            return False
+    elif not _artifact_current(tts_meta, [narration_artifact_path]):
         return False
     existing_engine = tts_info.get("engine")
     try:
@@ -430,10 +784,7 @@ def _run_cached_tail_step(video_path, work_dir, step, output_dir):
     if step == "tts":
         _clear_tts_cache(work_dir)
         narration = _load_tail_narration(work_dir)
-        tts_segments, engine_used = synthesize_tts(narration, work_dir)
-        tts_meta = work_dir / "tts_meta.json"
-        tts_meta.write_text(json.dumps(_tts_meta_payload(tts_segments, engine_used), ensure_ascii=False, indent=2))
-        _step_done(work_dir, "tts")
+        tts_segments, engine_used = _synthesize_tts_stateful(work_dir, narration, narration_artifact_path)
         log(f"步骤 tts 完成 ({len(tts_segments)} 段, 引擎: {engine_used})")
         return {"segments": tts_segments, "engine": engine_used}
 
@@ -444,9 +795,7 @@ def _run_cached_tail_step(video_path, work_dir, step, output_dir):
     else:
         _clear_tts_cache(work_dir)
         narration = _load_tail_narration(work_dir)
-        tts_segments, engine_used = synthesize_tts(narration, work_dir)
-        tts_meta.write_text(json.dumps(_tts_meta_payload(tts_segments, engine_used), ensure_ascii=False, indent=2))
-        _step_done(work_dir, "tts")
+        tts_segments, engine_used = _synthesize_tts_stateful(work_dir, narration, narration_artifact_path)
 
     output_path = work_dir / "output.mp4"
     assembly_input = _tail_video_path(video_path, work_dir)
@@ -455,9 +804,7 @@ def _run_cached_tail_step(video_path, work_dir, step, output_dir):
     ):
         log("跳过视频组装（已存在）")
     else:
-        assemble_video(assembly_input, tts_segments, work_dir, output_path)
-        _write_assemble_meta(work_dir, assembly_input)
-        _step_done(work_dir, "assemble")
+        _assemble_video_stateful(work_dir, assembly_input, tts_segments, output_path, [tts_meta, assembly_input])
 
     final_output = Path(output_dir) / f"recap_{video_path.stem}.mp4" if output_dir else work_dir.parent / f"recap_{video_path.stem}.mp4"
     if final_output != output_path:
@@ -484,11 +831,28 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         output_dir.mkdir(exist_ok=True)
         work_dir = output_dir / f"work_{int(time.time())}"
 
+    # style/scene_threshold 既可由 CLI 传入，也可能为 None（未显式传）。
+    # 落地到 CONFIG 后，_persist_run_settings 才能持久化，fresh run 也用同一套有效默认。
+    if style is not None:
+        CONFIG["style"] = style
+    else:
+        style = CONFIG.get("style", "纪录片")
+    if scene_threshold is not None:
+        CONFIG["scene_threshold"] = scene_threshold
+    # 解析成有效阈值（detect_scenes 在 None 时也会回落到 CONFIG），
+    # 让 fresh run 和 resume 的 detect 指纹一致，避免恢复后重跑场景检测。
+    scene_threshold = CONFIG.get("scene_threshold", 0.1)
+
     work_dir.mkdir(exist_ok=True)
     if resume_dir:
         _merge_run_settings(work_dir)
+        # resume 路径下，恢复后的 scene_threshold/style 存在 CONFIG 里，
+        # 重新读出以让本函数后续用上恢复值（其余 fps/context_info 直接读 CONFIG）。
+        scene_threshold = CONFIG.get("scene_threshold", scene_threshold)
+        style = CONFIG.get("style", style)
     else:
         _persist_run_settings(work_dir)
+    _init_workflow_state(work_dir, video_path)
     if not check_prerequisites(skip_asr=skip_asr):
         sys.exit(1)
     if CONFIG.get("burn_subtitles", False) and not _ffmpeg_has_filter("subtitles"):
@@ -519,7 +883,12 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     stop_after_script = False
     if step:
         if step in ("extract", "detect", "asr"):
-            result = steps[step]()
+            params = {
+                "extract": _extract_step_params(),
+                "detect": _detect_step_params(scene_threshold),
+                "asr": _asr_step_params(skip_asr),
+            }[step]
+            result = _run_stateful_step(work_dir, step, steps[step], params=params)
             log(f"步骤 {step} 完成")
             return result
         if step in ("tts", "assemble"):
@@ -536,7 +905,20 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     log("开始完整视频解说 pipeline")
     log("=" * 50)
 
-    needs_frame_vlm_api = not _is_step_done(work_dir, "vlm")
+    extract_params = _extract_step_params()
+    detect_params = _detect_step_params(scene_threshold)
+    asr_params = _asr_step_params(skip_asr)
+    vlm_params = {
+        "api_provider": CONFIG.get("api_provider"),
+        "api_url": CONFIG.get("api_url"),
+        "vlm_model": CONFIG.get("vlm_model"),
+        "fps": CONFIG["fps"],
+        "vlm_workers": CONFIG.get("vlm_workers"),
+        "context_info": CONFIG.get("context_info"),
+    }
+    if (work_dir / "scenes.json").exists():
+        vlm_params["scenes_fingerprint"] = file_fingerprint(work_dir / "scenes.json")
+    needs_frame_vlm_api = not _is_step_done(work_dir, "vlm", vlm_params)
     needs_mimo_video_api = (
         CONFIG.get("mimo_video_overview", False)
         and not _mimo_video_overview_current(work_dir)
@@ -568,63 +950,97 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     log(f"FPS: {CONFIG['fps']} (视频时长: {video_duration:.1f}s)")
 
     # Step 1: 帧提取
-    if _is_step_done(work_dir, "extract"):
+    if _is_step_done(work_dir, "extract", extract_params):
         frames = sorted((work_dir / "frames").glob("frame_*.jpg"))
         log(f"跳过帧提取（已存在 {len(frames)} 帧）")
     else:
         t0 = time.time()
-        frames = extract_frames(video_path, work_dir)
-        _step_done(work_dir, "extract")
+        frames = _run_stateful_step(
+            work_dir,
+            "extract",
+            lambda: extract_frames(video_path, work_dir),
+            params=extract_params,
+        )
         log(f"[{time.time()-t0:.1f}s] 帧提取完成")
 
     # Step 2: 场景检测
-    if _is_step_done(work_dir, "detect"):
+    if _is_step_done(work_dir, "detect", detect_params):
         scenes = json.loads((work_dir / "scenes.json").read_text())
         log(f"跳过场景检测（已存在 {len(scenes)} 个场景）")
     else:
         t0 = time.time()
-        scenes = detect_scenes(video_path, work_dir, scene_threshold)
-        _step_done(work_dir, "detect")
+        scenes = _run_stateful_step(
+            work_dir,
+            "detect",
+            lambda: detect_scenes(video_path, work_dir, scene_threshold),
+            params=detect_params,
+        )
         log(f"[{time.time()-t0:.1f}s] 场景检测完成")
 
     # Step 3: ASR
-    if _is_step_done(work_dir, "asr"):
+    if _is_step_done(work_dir, "asr", asr_params):
         asr_result = json.loads((work_dir / "asr_result.json").read_text())
         log(f"跳过 ASR（已存在 {len(asr_result)} 段）")
     elif skip_asr:
         asr_result = []
         (work_dir / "asr_result.json").write_text(
             json.dumps(asr_result, ensure_ascii=False, indent=2))
-        _step_done(work_dir, "asr")
+        _step_done(work_dir, "asr", params=asr_params)
         log("跳过 ASR")
     else:
         t0 = time.time()
+        _step_started(work_dir, "asr", params=asr_params)
         try:
-            asr_result = transcribe_audio(video_path, work_dir)
-        except Exception as e:
-            log(f"ASR 失败（继续无 ASR）: {e}")
-            asr_result = []
-        _step_done(work_dir, "asr")
+            try:
+                asr_result = transcribe_audio(video_path, work_dir)
+            except Exception as e:
+                log(f"ASR 失败（继续无 ASR）: {e}")
+                asr_result = []
+                (work_dir / "asr_result.json").write_text(
+                    json.dumps(asr_result, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            _step_done(work_dir, "asr", params=asr_params)
+        except Exception as exc:
+            _step_failed(work_dir, "asr", exc)
+            raise
         log(f"[{time.time()-t0:.1f}s] ASR 完成")
 
     # Step 3.5: 静音检测
-    if _is_step_done(work_dir, "silence"):
+    silence_params = {
+        "silence_noise_threshold": CONFIG.get("silence_noise_threshold"),
+        "silence_min_duration": CONFIG.get("silence_min_duration"),
+        "quiet_window_min": CONFIG.get("quiet_window_min"),
+        "silence_merge_gap": CONFIG.get("silence_merge_gap"),
+        "asr_result_fingerprint": file_fingerprint(work_dir / "asr_result.json")
+        if (work_dir / "asr_result.json").exists() else None,
+    }
+    if _is_step_done(work_dir, "silence", silence_params):
         silence_periods = json.loads((work_dir / "silence_periods.json").read_text())
         log(f"跳过静音检测（已存在 {len(silence_periods)} 个窗口）")
     else:
         t0 = time.time()
-        silence_periods = detect_silence_periods(video_path, work_dir, asr_result)
-        _step_done(work_dir, "silence")
+        silence_periods = _run_stateful_step(
+            work_dir,
+            "silence",
+            lambda: detect_silence_periods(video_path, work_dir, asr_result),
+            params=silence_params,
+        )
         log(f"[{time.time()-t0:.1f}s] 静音检测完成")
 
     # Step 4: VLM 分析
-    if _is_step_done(work_dir, "vlm"):
+    vlm_params["scenes_fingerprint"] = file_fingerprint(work_dir / "scenes.json") if (work_dir / "scenes.json").exists() else None
+    if _is_step_done(work_dir, "vlm", vlm_params):
         vlm_analysis = json.loads((work_dir / "vlm_analysis.json").read_text())
         log(f"跳过 VLM 分析（已存在 {len(vlm_analysis)} 个场景）")
     else:
         t0 = time.time()
-        vlm_analysis = analyze_scenes(scenes, frames, work_dir)
-        _step_done(work_dir, "vlm")
+        vlm_analysis = _run_stateful_step(
+            work_dir,
+            "vlm",
+            lambda: analyze_scenes(scenes, frames, work_dir),
+            params=vlm_params,
+        )
         log(f"[{time.time()-t0:.1f}s] VLM 分析完成")
 
     # Step 4.1: Optional MiMo scene-chunk video understanding
@@ -633,10 +1049,18 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
             log("跳过 MiMo 分片视频概览（已存在）")
         else:
             t0 = time.time()
-            overview = analyze_video_overview(video_path, work_dir, scenes)
+            mimo_params = mimo_video_settings_fingerprint()
+            _step_started(work_dir, "mimo_video_overview", params=mimo_params)
+            try:
+                overview = analyze_video_overview(video_path, work_dir, scenes)
+            except Exception as exc:
+                _step_failed(work_dir, "mimo_video_overview", exc)
+                raise
             if overview is not None:
-                _step_done(work_dir, "mimo_video_overview")
+                _step_done(work_dir, "mimo_video_overview", params=mimo_params)
                 log(f"[{time.time()-t0:.1f}s] MiMo 分片视频概览完成")
+            else:
+                _set_step_state(work_dir, "mimo_video_overview", "wait", params=mimo_params, err_msg="skipped")
 
     # Step 5: Agent-authored narration script and optional clip plan
     narration_path = work_dir / "narration.json"
@@ -646,43 +1070,54 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     source_narration = None
     assembly_video_path = video_path
     validated_plan = None
+    script_params = _script_step_params(work_dir, cut_mode=cut_mode, style=style)
 
-    if _is_step_done(work_dir, "script"):
-        source_narration = _load_json_file(narration_path, "narration.json")
-        clip_plan_for_lint = None
-        if cut_mode and (work_dir / "clip_plan_validated.json").exists():
-            clip_plan_for_lint = _load_json_file(work_dir / "clip_plan_validated.json", "clip_plan_validated.json")
-        elif cut_mode and clip_plan_path.exists():
-            clip_plan_for_lint = _load_json_file(clip_plan_path, "clip_plan.json")
-        validate_narration_or_raise(
-            source_narration, vlm_analysis, clip_plan=clip_plan_for_lint,
-            mode=CONFIG.get("edit_mode", "full"), work_dir=work_dir,
-        )
-        source_narration = _validate_narration_budget(source_narration, vlm_analysis)
+    if _is_step_done(work_dir, "script", script_params):
+        try:
+            source_narration = _load_json_file(narration_path, "narration.json")
+            clip_plan_for_lint = None
+            if cut_mode and (work_dir / "clip_plan_validated.json").exists():
+                clip_plan_for_lint = _load_json_file(work_dir / "clip_plan_validated.json", "clip_plan_validated.json")
+            elif cut_mode and clip_plan_path.exists():
+                clip_plan_for_lint = _load_json_file(clip_plan_path, "clip_plan.json")
+            validate_narration_or_raise(
+                source_narration, vlm_analysis, clip_plan=clip_plan_for_lint,
+                mode=CONFIG.get("edit_mode", "full"), work_dir=work_dir,
+            )
+            source_narration = _validate_narration_budget(source_narration, vlm_analysis)
+        except Exception as exc:
+            _step_failed(work_dir, "script", exc)
+            raise
         log(f"跳过解说词写作（已存在 {len(source_narration)} 段）")
     elif required_ready:
-        source_narration = _load_json_file(narration_path, "narration.json")
-        clip_plan_for_lint = None
-        if cut_mode:
-            raw_plan_for_lint = load_clip_plan(clip_plan_path)
-            clip_plan_for_lint = normalize_clip_plan(
-                raw_plan_for_lint, video_duration,
-                target_duration=_target_duration_seconds(),
-                clip_padding=CONFIG.get("clip_padding", 0.0),
-                allow_overlap=bool(CONFIG.get("allow_clip_overlap", False)),
+        _step_started(work_dir, "script", params=script_params)
+        try:
+            source_narration = _load_json_file(narration_path, "narration.json")
+            clip_plan_for_lint = None
+            if cut_mode:
+                raw_plan_for_lint = load_clip_plan(clip_plan_path)
+                clip_plan_for_lint = normalize_clip_plan(
+                    raw_plan_for_lint, video_duration,
+                    target_duration=_target_duration_seconds(),
+                    clip_padding=CONFIG.get("clip_padding", 0.0),
+                    allow_overlap=bool(CONFIG.get("allow_clip_overlap", False)),
+                )
+            validate_narration_or_raise(
+                source_narration, vlm_analysis, clip_plan=clip_plan_for_lint,
+                mode=CONFIG.get("edit_mode", "full"), work_dir=work_dir,
             )
-        validate_narration_or_raise(
-            source_narration, vlm_analysis, clip_plan=clip_plan_for_lint,
-            mode=CONFIG.get("edit_mode", "full"), work_dir=work_dir,
-        )
-        if cut_mode:
-            source_narration = _validate_narration_budget(source_narration, vlm_analysis)
-        else:
-            # _align_narration_to_quiet ends with _validate_narration_budget, so the
-            # budget+dedup pass runs exactly once here (previously it ran twice).
-            source_narration = _align_narration_to_quiet(source_narration, vlm_analysis, silence_periods)
-            narration_path.write_text(json.dumps(source_narration, ensure_ascii=False, indent=2), encoding="utf-8")
-        _step_done(work_dir, "script")
+            if cut_mode:
+                source_narration = _validate_narration_budget(source_narration, vlm_analysis)
+            else:
+                # _align_narration_to_quiet ends with _validate_narration_budget, so the
+                # budget+dedup pass runs exactly once here (previously it ran twice).
+                source_narration = _align_narration_to_quiet(source_narration, vlm_analysis, silence_periods)
+                narration_path.write_text(json.dumps(source_narration, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _step_failed(work_dir, "script", exc)
+            raise
+        script_params = _script_step_params(work_dir, cut_mode=cut_mode, style=style)
+        _step_done(work_dir, "script", params=script_params)
         log(f"Agent 解说词验证完成: {len(source_narration)} 段")
     if stop_after_script and source_narration is not None:
         return {
@@ -714,6 +1149,7 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         log(f"   {_resume_command(cli_path, video_path, work_dir)}")
         log("=" * 50)
         (work_dir / ".step_script.paused").write_text("", encoding="utf-8")
+        _set_step_state(work_dir, "script", "wait", params=script_params, err_msg=next_step)
         return {
             "status": "paused",
             "work_dir": str(work_dir),
@@ -749,9 +1185,7 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
     else:
         t0 = time.time()
         _clear_tts_cache(work_dir)
-        tts_segments, engine_used = synthesize_tts(narration, work_dir)
-        tts_meta.write_text(json.dumps(_tts_meta_payload(tts_segments, engine_used), ensure_ascii=False, indent=2))
-        _step_done(work_dir, "tts")
+        tts_segments, engine_used = _synthesize_tts_stateful(work_dir, narration, narration_artifact_path)
         log(f"[{time.time()-t0:.1f}s] TTS 完成 (引擎: {engine_used})")
 
     # Step 7: 组装
@@ -762,9 +1196,7 @@ def run_pipeline(video_path, output_dir=None, step=None, style="纪录片",
         log("跳过视频组装（已存在）")
     else:
         t0 = time.time()
-        assemble_video(assembly_video_path, tts_segments, work_dir, output_path)
-        _write_assemble_meta(work_dir, assembly_video_path)
-        _step_done(work_dir, "assemble")
+        _assemble_video_stateful(work_dir, assembly_video_path, tts_segments, output_path, [tts_meta, assembly_video_path])
         log(f"[{time.time()-t0:.1f}s] 视频组装完成")
 
     # 复制到输出目录

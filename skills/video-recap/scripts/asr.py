@@ -18,8 +18,13 @@ def transcribe_audio(video_path, work_dir):
 
     # 获取音频时长
     duration = get_video_duration(video_path)
-    if duration == 0:
-        duration = 180.0
+    if duration <= 0:
+        # ffprobe 失败时不再伪造 180s 时长，否则会向 asr_result.json 写入虚构时间戳
+        log("ASR 警告: 无法获取音频时长（ffprobe 失败），跳过 ASR 转录")
+        asr_result = []
+        asr_file = work_dir / "asr_result.json"
+        asr_file.write_text(json.dumps(asr_result, ensure_ascii=False, indent=2))
+        return asr_result
 
     segments_dir = work_dir / "audio_segments"
     segments_dir.mkdir(exist_ok=True)
@@ -74,9 +79,13 @@ def _segment_and_transcribe(audio_wav, segments_dir, total_duration, segment_len
         cmd = ["ffmpeg", "-y", "-i", str(audio_wav),
                "-ss", str(start), "-to", str(end),
                "-ar", "16000", "-ac", "1", str(seg_wav)]
-        run_cmd(cmd)
-
-        text = _run_asr(seg_wav)
+        cut = run_cmd(cmd)
+        if cut.returncode != 0:
+            # 切分失败时不要对磁盘上的陈旧/残缺音频转录，否则会得到错位文本
+            log(f"  段 {i+1}: 切分失败，跳过转录 ({cut.stderr.strip()[:200]})")
+            text = ""
+        else:
+            text = _run_asr(seg_wav)
         results.append({
             "start": round(start, 2),
             "end": round(end, 2),

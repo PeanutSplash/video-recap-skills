@@ -66,6 +66,8 @@
 | `ASR_BIN` | ASR 二进制路径 | local_transcribe (PATH 搜索) | 用自定义 ASR 时指定路径 |
 | `ASR_MODEL_DIR` | ASR 模型目录 | (空) | 本地 ASR 需要指定模型目录时设置 |
 | `ASR_SEGMENT_SECONDS` | ASR 分段窗口秒数 | 30 | 越小对白时间戳越精细；ASR 很慢时可调大以减少调用次数 |
+| `ASR_CHUNK_MIN_CHARS` | brief 中 ASR 写作分块最小字符数/词数 | 500 | 长对白 brief 过碎/过粗时调整 |
+| `ASR_CHUNK_MAX_CHARS` | brief 中 ASR 写作分块最大字符数/词数 | 800 | 控制 Agent 每次消化的对白窗口大小 |
 | `VLM_WORKERS` | VLM 并行线程数 | 8 | 代理/WAF 对并发敏感时设为 1 |
 | `TTS_WORKERS` | TTS 并行线程数 | 4 | MiMo/edge-tts 超时或限流时调低 |
 | `TTS_TIMEOUT` | 单段 TTS 命令超时秒数 | 90 | 网络慢时调高 |
@@ -75,6 +77,10 @@
 | `TARGET_DURATION` | cut 模式默认目标成片时长 | - | 例如 `10m` |
 | `CLIP_PADDING` | cut 模式默认片段 padding 秒数 | 0 | 例如 `0.5` |
 | `ALLOW_CLIP_OVERLAP` | cut 模式是否允许重复/重叠使用原片 | false | 重复画面需要明确映射时设为 1 |
+| `SCENE_JUNK_FILTER` | 是否过滤黑/白帧过渡场景 | true | 片头片尾黑白场景误删时设为 0 |
+| `SCENE_JUNK_DARK_LUMA` | 黑帧平均亮度阈值 | 8 | 黑帧判断过严/过松时调整 |
+| `SCENE_JUNK_BRIGHT_LUMA` | 白帧平均亮度阈值 | 245 | 白场过渡判断过严/过松时调整 |
+| `SCENE_JUNK_PIXEL_RATIO` | 黑/白像素占比阈值 | 0.995 | 过渡区噪点较多时可略降 |
 | `FORCE_VIDEO_REENCODE` | 组装阶段是否强制重编码视频 | false | 输出容器时间戳异常时设为 1 |
 | `SUBTITLE_FONT_NAME` | 压制字幕字体名 | Arial | 需要指定本机字体时调整 |
 | `SUBTITLE_FONT_SIZE` | 压制字幕字号 | 42 | 字幕过大/过小时调整 |

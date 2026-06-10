@@ -63,18 +63,27 @@ def _check_tts_smoke(voice: str) -> dict[str, object]:
         return {"ok": False, "skipped": True, "reason": "ffprobe not found"}
     with tempfile.TemporaryDirectory(prefix="video-recap-tts-smoke-") as tmp:
         media = Path(tmp) / "smoke.mp3"
-        result = _run([
-            edge_tts,
-            "--voice", voice,
-            "--text", "测试一下。",
-            "--write-media", str(media),
-        ], timeout=60)
+        try:
+            result = _run([
+                edge_tts,
+                "--voice", voice,
+                "--text", "测试一下。",
+                "--write-media", str(media),
+            ], timeout=60)
+        except subprocess.TimeoutExpired:
+            # 网络挂起（edge-tts 联网失败）时跳过冒烟测试而非崩溃
+            return {"ok": False, "skipped": True, "reason": "edge-tts smoke test timed out"}
+        except OSError as exc:
+            return {"ok": False, "skipped": True, "reason": f"edge-tts smoke test error: {exc}"}
         if result.returncode != 0:
             return {"ok": False, "error": (result.stderr or result.stdout)[-500:]}
-        probe = _run([
-            ffprobe, "-v", "quiet", "-show_entries", "format=duration",
-            "-of", "csv=p=0", str(media),
-        ])
+        try:
+            probe = _run([
+                ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(media),
+            ])
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {"ok": False, "skipped": True, "reason": f"ffprobe smoke check error: {exc}"}
         try:
             duration = float(probe.stdout.strip())
         except (TypeError, ValueError):
@@ -177,8 +186,13 @@ def build_report(*, tts_smoke: bool = False) -> dict[str, object]:
     tts = checks["tts"]  # type: ignore[index]
     if not tts.get("available"):  # type: ignore[union-attr]
         failures.append("Missing TTS engine; install edge-tts or configure MiMo TTS")
-    if tts_smoke and not checks.get("tts_smoke", {}).get("ok"):  # type: ignore[union-attr]
-        failures.append("edge-tts smoke test failed")
+    if tts_smoke:
+        smoke = checks.get("tts_smoke", {})  # type: ignore[assignment]
+        if smoke.get("skipped"):  # type: ignore[union-attr]
+            # 跳过（缺 edge-tts/ffprobe 或网络挂起）不算硬失败，例如纯 MiMo TTS 环境
+            warnings.append(f"edge-tts smoke test skipped: {smoke.get('reason') or 'unavailable'}")  # type: ignore[union-attr]
+        elif not smoke.get("ok"):  # type: ignore[union-attr]
+            failures.append("edge-tts smoke test failed")
     asr = checks["asr"]  # type: ignore[index]
     if not asr.get("available"):  # type: ignore[union-attr]
         warnings.append("ASR is not fully configured; pipeline can run with --skip-asr or continue without ASR on failure")
@@ -256,7 +270,8 @@ def _print_human(report: dict[str, object]) -> None:
     if "tts_smoke" in checks:
         smoke = checks["tts_smoke"]  # type: ignore[index]
         print("\n[tts_smoke]")
-        print(f"{_status_icon(bool(smoke.get('ok')))} result: {smoke}")
+        skipped = bool(smoke.get("skipped"))
+        print(f"{_status_icon(bool(smoke.get('ok')), warning=skipped)} result: {smoke}")
 
     if report.get("warnings"):
         print("\nWarnings:")

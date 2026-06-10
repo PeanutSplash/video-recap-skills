@@ -26,6 +26,183 @@ def _text_char_count(text):
     return len(re.sub(r'[，。！？、；：…“”‘’《》〈〉\s"\'「」『』（）()【】\[\]—～·,.!?;:\\-]', '', text or ""))
 
 
+def _contains_cjk(text):
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text or ""))
+
+
+def _writing_text_units(text):
+    """Length unit used for ASR writing chunks: CJK chars, otherwise words."""
+    text = str(text or "")
+    if _contains_cjk(text):
+        return len(re.sub(r"\s+", "", text))
+    return len(re.findall(r"\b\w+\b", text))
+
+
+def _sentence_pieces(text):
+    """Split text into sentence-like pieces while keeping terminal punctuation."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    parts = re.split(r"([。！？!?；;.])", text)
+    cleaned = []
+    for idx in range(0, len(parts), 2):
+        body = parts[idx].strip()
+        punct = parts[idx + 1] if idx + 1 < len(parts) else ""
+        if body or punct:
+            cleaned.append((body + punct).strip())
+    return cleaned or [text]
+
+
+def _split_text_by_sentence_windows(text, min_chars=500, max_chars=800):
+    """Clipto-style three-tier sentence boundary splitting for long ASR text."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    if _writing_text_units(text) <= max_chars:
+        return _sentence_pieces(text)
+
+    result = []
+    rest = text
+    sentence_marks = "。！？!?；;."
+    while _writing_text_units(rest) > max_chars:
+        # The min/max thresholds are unit-based but punctuation is char-indexed.
+        # For Chinese (the dominant recap target) these are nearly identical; for
+        # non-CJK this remains a safe sentence-boundary heuristic around words.
+        char_min = min(len(rest), max(1, min_chars))
+        char_max = min(len(rest), max(1, max_chars))
+        window = rest[:char_max]
+        cut = max(window.rfind(mark) for mark in sentence_marks)
+        if cut + 1 < char_min:
+            outside = -1
+            for i, ch in enumerate(rest[char_max:], start=char_max):
+                if ch in sentence_marks:
+                    outside = i
+                    break
+            if outside >= 0 and outside + 1 <= len(rest):
+                cut = outside
+            else:
+                cut = char_max - 1
+        piece = rest[:cut + 1].strip()
+        if not piece:
+            piece = rest[:char_max].strip()
+            cut = char_max - 1
+        result.append(piece)
+        rest = rest[cut + 1:].strip()
+    if rest:
+        result.append(rest)
+    return result
+
+
+def _timed_sentence_pieces(seg, min_chars, max_chars):
+    """Split one ASR segment into timed sentence pieces with approximate spans."""
+    text = str(seg.get("text", "")).strip()
+    if not text:
+        return []
+    try:
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start))
+    except (TypeError, ValueError):
+        start = end = 0.0
+    if end < start:
+        end = start
+    pieces = []
+    for sentence in _sentence_pieces(text):
+        if _writing_text_units(sentence) > max_chars:
+            pieces.extend(_split_text_by_sentence_windows(sentence, min_chars=min_chars, max_chars=max_chars))
+        else:
+            pieces.append(sentence)
+    total_units = sum(max(1, _writing_text_units(piece)) for piece in pieces) or 1
+    duration = max(0.0, end - start)
+    cursor = start
+    timed = []
+    for idx, piece in enumerate(pieces):
+        units = max(1, _writing_text_units(piece))
+        piece_duration = duration * units / total_units if duration else 0.0
+        piece_end = end if idx == len(pieces) - 1 else cursor + piece_duration
+        timed.append({
+            "start": round(cursor, 2),
+            "end": round(piece_end, 2),
+            "text": piece,
+            "char_count": _writing_text_units(piece),
+        })
+        cursor = piece_end
+    return timed
+
+
+def _scene_ids_for_range(scenes, start, end):
+    scene_ids = []
+    duration = max(0.001, float(end) - float(start))
+    for scene in scenes or []:
+        try:
+            s_start = float(scene.get("start", 0))
+            s_end = float(scene.get("end", s_start))
+        except (TypeError, ValueError):
+            continue
+        overlap = _overlap_seconds(start, end, s_start, s_end)
+        # Ignore tiny boundary tails from approximate ASR sentence timing. A
+        # scene id should mean the chunk materially belongs to that scene.
+        if overlap and (overlap >= duration * 0.2 or overlap >= 3.0):
+            scene_ids.append(scene.get("scene_id"))
+    return [sid for sid in scene_ids if sid is not None]
+
+
+def _chunk_asr_for_writing(segments, scenes_analysis=None, min_chars=None, max_chars=None):
+    """Chunk ASR into semantic windows before an agent writes long-dialogue recaps.
+
+    The strategy mirrors Clipto's segment splitter: accumulate a window, prefer
+    the last sentence boundary inside max length, allow a slightly longer first
+    boundary outside the window, and fall back to the remaining text. CJK text is
+    measured by characters; non-CJK text is measured by words.
+    """
+    min_chars = int(min_chars or CONFIG.get("asr_chunk_min_chars", 500))
+    max_chars = int(max_chars or CONFIG.get("asr_chunk_max_chars", 800))
+    min_chars = max(1, min(min_chars, max_chars))
+    max_chars = max(min_chars, max_chars)
+
+    pieces = []
+    for seg in segments or []:
+        if isinstance(seg, dict):
+            pieces.extend(_timed_sentence_pieces(seg, min_chars, max_chars))
+
+    chunks = []
+    current = []
+    current_units = 0
+    current_scene_ids = set()
+
+    def flush():
+        nonlocal current, current_units, current_scene_ids
+        if not current:
+            return
+        chunks.append({
+            "chunk_id": len(chunks),
+            "start": round(float(current[0]["start"]), 2),
+            "end": round(float(current[-1]["end"]), 2),
+            "scene_ids": sorted(current_scene_ids),
+            "char_count": current_units,
+            "text": " ".join(piece["text"] for piece in current).strip(),
+            "segments": current,
+        })
+        current = []
+        current_units = 0
+        current_scene_ids = set()
+
+    for piece in pieces:
+        units = max(1, int(piece.get("char_count", _writing_text_units(piece.get("text", "")))))
+        piece_scene_ids = set(_scene_ids_for_range(scenes_analysis, piece["start"], piece["end"]))
+        crosses_scene = current and current_scene_ids and piece_scene_ids and not (current_scene_ids & piece_scene_ids)
+        if crosses_scene and current_units >= min_chars:
+            flush()
+        if current and current_units >= min_chars and current_units + units > max_chars:
+            flush()
+        current.append(piece)
+        current_scene_ids.update(piece_scene_ids)
+        current_units += units
+        if current_units >= max_chars:
+            flush()
+    flush()
+    return chunks
+
+
 def _truncate_at_sentence(text, max_chars):
     """在句子边界截断，不产生残句。max_chars 按有效字符计（不含标点空白）。"""
     if _text_char_count(text) <= max_chars:
@@ -37,14 +214,12 @@ def _truncate_at_sentence(text, max_chars):
         if eff > max_chars:
             cutoff = i + 1
             break
-    for sep in ['。', '！', '？', '!', '?']:
-        idx = text[:cutoff].rfind(sep)
-        if idx > 0:
-            return text[:idx + 1]
-    for sep in ['，', '、', '；', ',']:
-        idx = text[:cutoff].rfind(sep)
-        if idx > 3:
-            return text[:idx] + '。'
+    idx = max(text[:cutoff].rfind(sep) for sep in ['。', '！', '？', '!', '?'])
+    if idx > 0:
+        return text[:idx + 1]
+    idx = max(text[:cutoff].rfind(sep) for sep in ['，', '、', '；', ','])
+    if idx > 3:
+        return text[:idx] + '。'
     return ""
 
 
@@ -417,8 +592,9 @@ def _validate_narration_budget(narration, scenes_analysis):
                 log(f"  解说超预算且无法安全截断，已丢弃: {item['start']:.1f}-{item['end']:.1f}s")
                 continue
         item["narration"] = _clean_narration_punctuation(item["narration"])
-        if item["narration"].strip()[-1] in "，：、；,—…":
-            item["narration"] += "。"
+        stripped = item["narration"].strip()
+        if stripped and stripped[-1] in "，：、；,—":
+            item["narration"] = stripped.rstrip("，：、；,—") + "。"
         cleaned.append(item)
 
     cleaned.sort(key=lambda n: n["start"])
@@ -512,12 +688,86 @@ def _quiet_overlap_seconds(start, end, quiet_windows):
     overlap_seconds = 0.0
     for qw in quiet_windows:
         try:
-            q_start = float(qw.get("start", 0))
-            q_end = float(qw.get("end", q_start))
+            if isinstance(qw, dict):
+                q_start = float(qw.get("start", 0))
+                q_end = float(qw.get("end", q_start))
+            else:
+                q_start, q_end = qw
+                q_start = float(q_start)
+                q_end = float(q_end)
         except (TypeError, ValueError):
             continue
         overlap_seconds += max(0.0, min(float(end), q_end) - max(float(start), q_start))
     return overlap_seconds
+
+
+def _overlap_seconds(start, end, other_start, other_end):
+    return max(0.0, min(float(end), float(other_end)) - max(float(start), float(other_start)))
+
+
+def _build_timeline_fusion(scenes, asr_segments, silence_periods):
+    """Fuse VLM scenes, ASR dialogue and quiet narration slots on one timeline."""
+    fusion = []
+    quiet_windows = [w for w in silence_periods or [] if not w.get("has_speech", False)]
+    for scene in scenes or []:
+        try:
+            start = float(scene.get("start", 0))
+            end = float(scene.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        dialogue_segments = []
+        dialogue_overlap = 0.0
+        for seg in asr_segments or []:
+            if not isinstance(seg, dict):
+                continue
+            try:
+                seg_start = float(seg.get("start", 0))
+                seg_end = float(seg.get("end", seg_start))
+            except (TypeError, ValueError):
+                continue
+            overlap = _overlap_seconds(start, end, seg_start, seg_end)
+            if overlap <= 0:
+                continue
+            text = str(seg.get("text", "")).strip()
+            dialogue_overlap += overlap
+            dialogue_segments.append({
+                "start": round(seg_start, 2),
+                "end": round(seg_end, 2),
+                "overlap_seconds": round(overlap, 2),
+                "text": text,
+            })
+
+        narration_slots = []
+        for window in quiet_windows:
+            try:
+                w_start = float(window.get("start", 0))
+                w_end = float(window.get("end", w_start))
+            except (TypeError, ValueError):
+                continue
+            overlap = _overlap_seconds(start, end, w_start, w_end)
+            if overlap <= 0:
+                continue
+            slot_start = max(start, w_start)
+            slot_end = min(end, w_end)
+            narration_slots.append({
+                "start": round(slot_start, 2),
+                "end": round(slot_end, 2),
+                "duration": round(slot_end - slot_start, 2),
+                "char_budget": _recommended_char_budget(slot_start, slot_end),
+            })
+
+        fusion.append({
+            "scene_id": scene.get("scene_id"),
+            "time_range": [round(start, 2), round(end, 2)],
+            "visual_description": scene.get("description", ""),
+            "depth_analysis": scene.get("depth_analysis", ""),
+            "frame_facts": scene.get("frame_facts", {}),
+            "dialogue_segments": dialogue_segments,
+            "dialogue_overlap_seconds": round(dialogue_overlap, 2),
+            "narration_slots": narration_slots,
+            "recommended_mode": "quiet-slot" if narration_slots and dialogue_overlap < (end - start) * 0.4 else "ducked-bed",
+        })
+    return fusion
 
 
 def _load_background_research(work_dir):
@@ -656,6 +906,74 @@ def _format_substrate_warning(assessment):
     ]
 
 
+def _write_json_artifact(work_dir, name, payload):
+    path = Path(work_dir) / name
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _format_asr_chunks_for_brief(chunks, max_chunks=24):
+    if not chunks:
+        return []
+    lines = [
+        "## ASR writing chunks (semantic windows)",
+        "",
+        "Use these chunks as the dialogue spine instead of swallowing the full transcript at once.",
+        "Full data: `asr_writing_chunks.json`.",
+        "",
+    ]
+    for chunk in chunks[:max_chunks]:
+        scene_ids = ",".join(str(sid) for sid in chunk.get("scene_ids", [])) or "n/a"
+        text = str(chunk.get("text", "")).strip()
+        if len(text) > 900:
+            text = text[:897] + "..."
+        lines.extend([
+            f"### ASR chunk {chunk['chunk_id'] + 1}: {chunk['start']:.1f}-{chunk['end']:.1f}s | scenes {scene_ids} | {chunk['char_count']} units",
+            text or "(empty transcript chunk)",
+            "",
+        ])
+    if len(chunks) > max_chunks:
+        lines.append(f"... {len(chunks) - max_chunks} more chunks in `asr_writing_chunks.json`.")
+        lines.append("")
+    return lines
+
+
+def _format_timeline_fusion_for_brief(fusion, max_items=40):
+    if not fusion:
+        return []
+    lines = [
+        "## Timeline fusion (VLM + ASR + quiet slots)",
+        "",
+        "This is the pre-aligned multimodal view. Use `narration_slots` when available; otherwise write ducked-bed beats around dialogue.",
+        "Full data: `timeline_fusion.json`.",
+        "",
+    ]
+    for item in fusion[:max_items]:
+        start, end = item.get("time_range", [0, 0])
+        slots = item.get("narration_slots") or []
+        slot_text = ", ".join(
+            f"{slot['start']:.1f}-{slot['end']:.1f}s/{slot['char_budget']}字"
+            for slot in slots[:4]
+        ) or "none"
+        dialogue = item.get("dialogue_segments") or []
+        dialogue_text = "; ".join(
+            f"{seg['start']:.1f}-{seg['end']:.1f}s {seg.get('text', '')[:80]}"
+            for seg in dialogue[:3]
+            if seg.get("text")
+        ) or "none"
+        lines.extend([
+            f"### Fusion scene {item.get('scene_id')}: {start:.1f}-{end:.1f}s ({item.get('recommended_mode')})",
+            f"- Visual: {item.get('visual_description', '')}",
+            f"- Dialogue overlap: {item.get('dialogue_overlap_seconds', 0):.1f}s | {dialogue_text}",
+            f"- Narration slots: {slot_text}",
+            "",
+        ])
+    if len(fusion) > max_items:
+        lines.append(f"... {len(fusion) - max_items} more fused scenes in `timeline_fusion.json`.")
+        lines.append("")
+    return lines
+
+
 def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_duration, work_dir, style="纪录片"):
     """Write a compact brief that tells the agent exactly how to author recap artifacts."""
     effective_rate = CONFIG["speech_rate"] * CONFIG["speech_safety_margin"]
@@ -689,6 +1007,13 @@ def build_agent_brief(scenes_analysis, asr_result, silence_periods, video_durati
     substrate = assess_understanding_substrate(scenes_analysis, asr_result)
     lines.extend(_format_substrate_warning(substrate))
     lines.extend(_format_background_research(_load_background_research(work_dir)))
+
+    asr_chunks = _chunk_asr_for_writing(asr_result, scenes_analysis)
+    timeline_fusion = _build_timeline_fusion(scenes_analysis, asr_result, silence_periods)
+    _write_json_artifact(work_dir, "asr_writing_chunks.json", asr_chunks)
+    _write_json_artifact(work_dir, "timeline_fusion.json", timeline_fusion)
+    lines.extend(_format_asr_chunks_for_brief(asr_chunks))
+    lines.extend(_format_timeline_fusion_for_brief(timeline_fusion))
 
     if mimo_overview_path.exists():
         try:

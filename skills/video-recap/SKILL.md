@@ -86,9 +86,12 @@ python3 scripts/video_recap.py --doctor
 - `subtitles.srt` — 字幕
 - `subtitles.ass` — `--burn-subtitles` 时用于压制的字幕
 - `work_dir/agent_narration_brief.md` — 解说词写作 brief
+- `work_dir/asr_writing_chunks.json` — 按语义句界切分的 ASR 写稿块
+- `work_dir/timeline_fusion.json` — VLM/ASR/静音窗口对齐后的时间轴视图
 - `work_dir/narration.json` — Agent 写的解说词
 - `work_dir/clip_plan.json` — cut 模式下 Agent 选择的原片片段
 - `work_dir/mimo_video_overview.json` — 可选 MiMo 场景分片视频理解结果
 - `work_dir/edited_source.mp4` — cut 模式下拼出的短视频源
 - `work_dir/narration_mapped.json` — cut 模式下映射到短视频时间轴的解说词
+- `work_dir/workflow_state.json` — 步骤状态、耗时、参数指纹与视频内容指纹
 - `work_dir/` — 所有中间 JSON

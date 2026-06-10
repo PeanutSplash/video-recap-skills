@@ -11,6 +11,10 @@ def extract_frames(video_path, work_dir, fps=None):
     frames_dir = work_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
 
+    # 清理上一次（可能更高 fps）残留的帧，避免陈旧帧泄漏进本次结果
+    for stale in frames_dir.glob("frame_*.jpg"):
+        stale.unlink()
+
     output_pattern = str(frames_dir / "frame_%05d.jpg")
     cmd = ["ffmpeg", "-y", "-i", str(video_path),
            "-vf", f"fps={fps}", "-q:v", "2", output_pattern]

@@ -8,18 +8,29 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'video-recap' / 'scripts'))
 
-from common import _api_headers, _prepare_api_payload, _provider_uses_mimo, _retry_after_seconds, get_video_duration
+from common import (
+    _api_headers,
+    _prepare_api_payload,
+    _provider_uses_mimo,
+    _retry_after_seconds,
+    file_fingerprint,
+    get_video_duration,
+    step_cache_key,
+)
 from config import CONFIG, default_mimo_api_url, env_bool, env_float, env_int, normalize_api_url
-from detect import detect_scenes
+from detect import _filter_junk_scenes, detect_scenes
 from extract import extract_frames
 from pipeline import (
     _annotate_cut_narration_overlap,
     _assemble_settings_current,
+    _assemble_artifact_current,
     _command_available,
     _ffmpeg_has_filter,
     _load_run_settings,
+    _load_workflow_state,
     _mimo_video_overview_current,
     _tts_meta_current,
+    _write_assemble_meta_with_sources,
     run_pipeline,
 )
 from edit import (
@@ -31,6 +42,8 @@ from edit import (
 )
 from narration import (
     _align_narration_to_quiet,
+    _build_timeline_fusion,
+    _chunk_asr_for_writing,
     _post_dedup_narration,
     _text_char_count,
     assess_understanding_substrate,
@@ -1628,6 +1641,155 @@ def test_build_agent_brief_warns_on_empty_substrate(monkeypatch, tmp_path):
     )
     text = brief.read_text(encoding="utf-8")
     assert "SUBSTRATE IS EMPTY" in text
+
+
+def test_content_fingerprint_cache_keys_ignore_path_and_mtime(tmp_path):
+    first = tmp_path / "a.mp4"
+    second = tmp_path / "nested" / "b.mp4"
+    second.parent.mkdir()
+    first.write_bytes(b"same video bytes" * 100)
+    second.write_bytes(first.read_bytes())
+
+    assert file_fingerprint(first) == file_fingerprint(second)
+    assert step_cache_key(first, "vlm", {"model": "x"}) == step_cache_key(second, "vlm", {"model": "x"})
+    assert step_cache_key(first, "vlm", {"model": "x"}) != step_cache_key(first, "vlm", {"model": "y"})
+
+
+def test_assemble_cache_uses_content_fingerprints_not_source_paths(monkeypatch, tmp_path):
+    video = tmp_path / "video.mp4"
+    video_copy = tmp_path / "copied" / "renamed.mp4"
+    video_copy.parent.mkdir()
+    video.write_bytes(b"video-content")
+    video_copy.write_bytes(video.read_bytes())
+    meta = tmp_path / "tts_meta.json"
+    meta_copy = tmp_path / "other_tts_meta.json"
+    meta.write_text('{"segments":[],"engine":"edge-tts"}', encoding="utf-8")
+    meta_copy.write_text(meta.read_text(encoding="utf-8"), encoding="utf-8")
+    output = tmp_path / "output.mp4"
+    output.write_bytes(b"rendered")
+
+    monkeypatch.setitem(CONFIG, "burn_subtitles", False)
+    _write_assemble_meta_with_sources(tmp_path, video, [meta, video])
+
+    assert _assemble_artifact_current(tmp_path, output, [meta_copy, video_copy], video_copy)
+
+    meta_copy.write_text('{"segments":[{"changed":true}],"engine":"edge-tts"}', encoding="utf-8")
+    assert not _assemble_artifact_current(tmp_path, output, [meta_copy, video_copy], video_copy)
+
+
+def test_asr_chunks_split_on_sentences_and_track_scene_ids(monkeypatch):
+    monkeypatch.setitem(CONFIG, "asr_chunk_min_chars", 8)
+    monkeypatch.setitem(CONFIG, "asr_chunk_max_chars", 16)
+    chunks = _chunk_asr_for_writing(
+        [{
+            "start": 0.0,
+            "end": 40.0,
+            "text": "第一句很重要。第二句继续推进。第三句制造悬念。第四句收尾。",
+        }],
+        [
+            {"scene_id": 0, "start": 0.0, "end": 20.0},
+            {"scene_id": 1, "start": 20.0, "end": 40.0},
+        ],
+    )
+
+    assert len(chunks) >= 2
+    assert chunks[0]["text"].endswith("。")
+    assert all(chunk["char_count"] <= 16 for chunk in chunks)
+    assert chunks[0]["scene_ids"] == [0]
+    assert chunks[-1]["scene_ids"] == [1]
+
+
+def test_timeline_fusion_aligns_scenes_dialogue_and_quiet_slots():
+    fusion = _build_timeline_fusion(
+        [{"scene_id": 0, "start": 0.0, "end": 10.0, "description": "对峙", "frame_facts": {"1.0": ["看门"]}}],
+        [
+            {"start": 2.0, "end": 4.0, "text": "你到底是谁"},
+            {"start": 8.0, "end": 12.0, "text": "跨场对白"},
+        ],
+        [
+            {"start": 0.0, "end": 1.0, "duration": 1.0, "has_speech": False},
+            {"start": 5.0, "end": 7.0, "duration": 2.0, "has_speech": False},
+            {"start": 9.0, "end": 9.5, "duration": 0.5, "has_speech": True},
+        ],
+    )
+
+    item = fusion[0]
+    assert item["dialogue_overlap_seconds"] == 4.0
+    assert [seg["text"] for seg in item["dialogue_segments"]] == ["你到底是谁", "跨场对白"]
+    assert [(slot["start"], slot["end"]) for slot in item["narration_slots"]] == [(0.0, 1.0), (5.0, 7.0)]
+    assert item["frame_facts"] == {"1.0": ["看门"]}
+
+
+def test_filter_junk_scenes_removes_black_or_white_transitions_but_keeps_fallback(monkeypatch):
+    scenes = [
+        {"start": 0.0, "end": 1.0},
+        {"start": 1.0, "end": 2.0},
+        {"start": 2.0, "end": 3.0},
+    ]
+
+    monkeypatch.setattr("detect._is_junk_scene", lambda video, ts: ts < 1.0)
+    assert _filter_junk_scenes(scenes, Path("video.mp4")) == scenes[1:]
+
+    monkeypatch.setattr("detect._is_junk_scene", lambda video, ts: True)
+    assert _filter_junk_scenes(scenes, Path("video.mp4")) == scenes
+
+
+def test_agent_brief_writes_asr_chunks_and_timeline_fusion(monkeypatch, tmp_path):
+    monkeypatch.setitem(CONFIG, "edit_mode", "full")
+    monkeypatch.setitem(CONFIG, "target_duration", "")
+    monkeypatch.setitem(CONFIG, "context_info", "")
+    monkeypatch.setitem(CONFIG, "asr_chunk_min_chars", 5)
+    monkeypatch.setitem(CONFIG, "asr_chunk_max_chars", 12)
+
+    brief = build_agent_brief(
+        [{"scene_id": 0, "start": 0.0, "end": 6.0, "description": "门口对峙"}],
+        [{"start": 1.0, "end": 5.0, "text": "第一句对白。第二句反击。"}],
+        [{"start": 0.0, "end": 1.0, "duration": 1.0, "has_speech": False}],
+        6.0,
+        tmp_path,
+    )
+
+    text = brief.read_text(encoding="utf-8")
+    assert "ASR writing chunks" in text
+    assert "Timeline fusion" in text
+    assert (tmp_path / "asr_writing_chunks.json").exists()
+    assert (tmp_path / "timeline_fusion.json").exists()
+    fusion = json.loads((tmp_path / "timeline_fusion.json").read_text(encoding="utf-8"))
+    assert fusion[0]["dialogue_segments"][0]["text"] == "第一句对白。第二句反击。"
+
+
+def test_run_pipeline_records_workflow_state(monkeypatch, tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+
+    monkeypatch.setitem(CONFIG, "api_key", "test-key")
+    monkeypatch.setitem(CONFIG, "fps", 1)
+    monkeypatch.setitem(CONFIG, "edit_mode", "full")
+    monkeypatch.setitem(CONFIG, "burn_subtitles", False)
+    monkeypatch.setattr("pipeline.check_prerequisites", lambda skip_asr=False: True)
+    monkeypatch.setattr("pipeline.get_video_duration", lambda path: 5.0)
+    monkeypatch.setattr("pipeline.api_call", lambda payload: {"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr("pipeline.extract_frames", lambda video_path, work_dir: [work_dir / "frames" / "frame_00001.jpg"])
+    monkeypatch.setattr("pipeline.detect_scenes", lambda video_path, work_dir, threshold: [{"scene_id": 0, "start": 0.0, "end": 5.0}])
+    monkeypatch.setattr("pipeline.transcribe_audio", lambda video_path, work_dir: [])
+    monkeypatch.setattr("pipeline.detect_silence_periods", lambda video_path, work_dir, asr: [{"start": 0.0, "end": 5.0, "duration": 5.0, "has_speech": False}])
+    monkeypatch.setattr("pipeline.analyze_scenes", lambda scenes, frames, work_dir: [{
+        "scene_id": 0,
+        "start": 0.0,
+        "end": 5.0,
+        "description": "测试场景。",
+    }])
+
+    result = run_pipeline(video, output_dir=tmp_path / "out")
+    state = _load_workflow_state(Path(result["work_dir"]))
+
+    assert state["video_fingerprint"] == file_fingerprint(video)
+    assert state["steps"]["extract"]["status"] == "done"
+    assert state["steps"]["detect"]["status"] == "done"
+    assert state["steps"]["asr"]["status"] == "done"
+    assert state["steps"]["silence"]["status"] == "done"
+    assert state["steps"]["vlm"]["status"] == "done"
+    assert "params_fingerprint" in state["steps"]["vlm"]
 
 
 def test_assess_understanding_substrate_levels():

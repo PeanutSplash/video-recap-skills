@@ -1,8 +1,8 @@
 # 断点续跑与局部重跑
 
-Pipeline 会在 `work_dir` 下用 `.step_*.done` 标记已完成阶段。
+Pipeline 会在 `work_dir` 下写 `workflow_state.json` 记录统一步骤状态、耗时、参数指纹和输入视频内容指纹；同时保留 `.step_*.done` 作为兼容旧工作目录和手动清理的标记。
 
-组装阶段还会写 `assemble_meta.json`，记录是否压制字幕、压制字幕样式、是否强制重编码等渲染设置。续跑时这些设置变化会自动触发重新组装，避免复用旧的 `output.mp4`。
+组装阶段还会写 `assemble_meta.json`，记录是否压制字幕、压制字幕样式、是否强制重编码等渲染设置，以及 TTS meta / 输入视频的内容指纹。续跑时这些设置或内容指纹变化会自动触发重新组装，避免复用旧的 `output.mp4`。
 
 | 标记 | 阶段 |
 |------|------|
@@ -15,6 +15,12 @@ Pipeline 会在 `work_dir` 下用 `.step_*.done` 标记已完成阶段。
 | `.step_edit.done` | cut 模式剪辑源视频与时间轴映射已生成 |
 | `.step_tts.done` | TTS 合成 |
 | `.step_assemble.done` | 视频组装 |
+
+## 内容指纹缓存
+
+新工作目录会记录输入视频的快速内容指纹（文件大小 + 首尾采样 hash），不再只依赖路径或 mtime。相同视频复制到不同路径时，TTS/组装等尾部产物可以通过内容指纹判断是否仍可复用；视频内容变化时，`workflow_state.json` 会清空旧步骤状态并要求重新分析。
+
+`tts_meta.json` 和 `assemble_meta.json` 也会记录相关输入文件的内容指纹。改 `narration.json`、`narration_mapped.json`、TTS 设置或组装设置后，续跑会自动判断尾部缓存是否过期。
 
 ## 写好 narration.json 后继续
 
