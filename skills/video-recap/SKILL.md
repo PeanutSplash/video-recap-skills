@@ -53,8 +53,8 @@ python3 scripts/video_recap.py <video> --edit-mode cut --target-duration 10m
 
 ### 2. 撰写解说词
 
-读取 `work_dir/agent_narration_brief.md` 以及 vlm_analysis / asr_result / silence_periods，写 `work_dir/narration.json`。cut 模式还要写 `work_dir/clip_plan.json`，时间戳都使用原视频时间。
-字段格式与写作规则见 `agent-mode-workflow.md`。
+读取 `work_dir/agent_narration_brief.md` 以及 vlm_analysis / asr_result / silence_periods，写 `work_dir/narration.json`。cut 模式还要按 `agent-mode-workflow.md` 先写 `clip_plan.json`，完成 `clip_plan_review.md` 片段审阅后再写解说。时间戳都使用原视频时间。
+字段格式、cut 模式顺序与写作规则见 `agent-mode-workflow.md`。
 
 ### 3. （可选）背景调研
 
