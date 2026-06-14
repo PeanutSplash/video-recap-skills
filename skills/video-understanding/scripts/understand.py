@@ -28,6 +28,40 @@ def _fresh(out, *inputs):
     return out.stat().st_mtime >= max(p.stat().st_mtime for p in ins)
 
 
+def _research_context(work_dir):
+    """Fold background_research.json into a compact context string for the VLM prompt.
+
+    The agent does story research first (per references/research-guide.md) and writes
+    work_dir/background_research.json; this surfaces the synopsis, episode/world context,
+    and named characters so per-scene VLM analysis can name people and read scenes with
+    plot knowledge instead of labelling everyone "黑衣男子". Returns "" when no usable
+    research file is present, so behaviour is unchanged without it.
+    """
+    path = Path(work_dir) / "background_research.json"
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    parts = []
+    for key in ("synopsis", "episode_context", "worldbuilding"):
+        val = str(data.get(key, "")).strip()
+        if val:
+            parts.append(val)
+    chars = data.get("characters")
+    if isinstance(chars, dict) and chars:
+        named = "；".join(
+            f"{name}（{str(desc).strip()}）" for name, desc in list(chars.items())[:12]
+            if str(name).strip()
+        )
+        if named:
+            parts.append("主要人物：" + named)
+    return " ".join(parts).strip()[:1200]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Analyze a video into an understanding index + narration brief.")
     ap.add_argument("video")
@@ -45,8 +79,14 @@ def main():
     video = args.video
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    if args.context:
-        CONFIG["context_info"] = args.context
+    # Story research (if the agent wrote background_research.json first) feeds the VLM
+    # context, so scene analysis can name characters and read scenes with plot knowledge.
+    research_ctx = _research_context(work_dir)
+    context_parts = [p for p in (research_ctx, args.context) if p and p.strip()]
+    if context_parts:
+        CONFIG["context_info"] = "　".join(context_parts)
+    if research_ctx:
+        log(f"已并入 background_research.json 到理解上下文（{len(research_ctx)} 字）")
     if args.scene_threshold is not None:
         CONFIG["scene_threshold"] = args.scene_threshold
     if args.mimo_video_overview:

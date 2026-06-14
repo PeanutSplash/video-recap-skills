@@ -35,14 +35,22 @@ Overridable defaults (zero-config otherwise): see `references/config-playbook.md
 
 ## Use
 
+### 0. Research first (recommended)
+
+If you can identify the source (show, film, topic), research it **before** analyzing and write
+`work_dir/background_research.json` (see `video-understanding/references/research-guide.md`).
+video-understanding folds it into the VLM context, so scene analysis can name characters and read
+scenes with plot knowledge instead of labelling everyone "黑衣男子". Skip it when you can't research.
+
 ### 1. Analyze → pause for narration
 
 ```bash
 python3 scripts/recap.py <video> --work-dir <work_dir> --context "背景"
 ```
 
-Runs video-understanding, writes `agent_narration_brief.md`, and pauses. Then **write
-`work_dir/narration.json`** following the **video-script** skill (read the brief first).
+Runs video-understanding (using `background_research.json` if you wrote it), writes
+`agent_narration_brief.md`, and pauses. Then **write `work_dir/narration.json`** following the
+**video-script** skill (read the brief first).
 Cut mode (`--edit-mode cut --target-duration 10m`) also requires `clip_plan.json`.
 
 ### 2. Continue → produce the recap
@@ -69,7 +77,7 @@ python3 scripts/recap.py --doctor
 
 ## Options (passed through to the stage skills)
 `--context`, `--scene-threshold`, `--style`, `--edit-mode {full,cut}`, `--target-duration`,
-`--skip-asr`, `--mimo-video-overview`, `--voice`, `--mimo-tts-voice`, `--tts-engine`,
+`--skip-asr`, `--mimo-video-overview`, `--consolidate`, `--consolidate-asr`, `--mimo-tts-voice`,
 `--burn-subtitles`, `--output-dir`.
 
 ## What this skill does NOT do

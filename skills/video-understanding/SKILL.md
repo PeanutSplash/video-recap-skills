@@ -32,6 +32,11 @@ export MIMO_API_KEY=***          # one key drives ASR (mimo-v2.5-asr) + VLM (mim
 ASR uses MiMo `mimo-v2.5-asr`; without `MIMO_API_KEY` it is skipped (or pass `--skip-asr`).
 Optional MiMo scene-chunk video understanding: `--mimo-video-overview`.
 
+If `work_dir/background_research.json` exists (story research the agent did first, see
+`references/research-guide.md`), its synopsis and named characters are folded into the VLM
+context, so scene descriptions can name people and read scenes with plot knowledge. Combine with
+`--context` for a quick inline hint.
+
 ## Run
 
 ```bash

@@ -194,6 +194,29 @@ def test_filter_junk_scenes_removes_black_or_white_transitions_but_keeps_fallbac
     assert _filter_junk_scenes(scenes, Path("video.mp4")) == scenes
 
 
+def test_research_context_feeds_vlm_from_background_research(tmp_path):
+    import json
+    from understand import _research_context
+    (tmp_path / "background_research.json").write_text(json.dumps({
+        "synopsis": "现代灵魂穿越古代的故事。",
+        "episode_context": "第一集，主角范闲登场。",
+        "characters": {"范闲": "核心男主角", "张庆": "年轻黑衣男子，戴眼镜，大学生"},
+        "noise": "x" * 5000,
+    }, ensure_ascii=False), encoding="utf-8")
+
+    ctx = _research_context(tmp_path)
+
+    assert "现代灵魂穿越古代" in ctx
+    assert "范闲（核心男主角）" in ctx
+    assert "张庆（年轻黑衣男子，戴眼镜，大学生）" in ctx
+    assert len(ctx) <= 1200  # bounded so it never blows the VLM prompt budget
+
+
+def test_research_context_empty_without_file(tmp_path):
+    from understand import _research_context
+    assert _research_context(tmp_path) == ""
+
+
 def test_segment_and_transcribe_uses_configured_window(monkeypatch, tmp_path):
     monkeypatch.setitem(CONFIG, "asr_segment_seconds", 30.0)
     monkeypatch.setattr(asr_module, "run_cmd",

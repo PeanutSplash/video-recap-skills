@@ -21,38 +21,19 @@ https://github.com/user-attachments/assets/92698ec6-0d23-4f9f-8825-c3684ef57aff
 好上手的地方在于：语音转写、画面理解、语音合成全都走 [小米 MiMo](https://platform.xiaomimimo.com)，本地只装一个 `ffmpeg`。不碰 GPU，不下模型，也不用另起服务，macOS、Linux、Windows 都能跑。
 
 ```mermaid
-flowchart TB
-    input([输入视频]) --> understand
-    context[[背景调研 / 上下文]] -.-> script
+flowchart TD
+    research["背景调研<br/>background_research.json"] --> understand
+    video(["输入视频"]) --> understand["video-understanding<br/>场景 · ASR · VLM · brief"]
+    understand --> script["video-script<br/>Agent 写 narration.json"]
+    script --> voiceover["video-voiceover<br/>MiMo TTS"]
+    voiceover --> assemble["video-assemble<br/>混音 · 压低 · 字幕"]
+    assemble --> output(["Recap 视频"])
+    script -. 剪辑模式 .-> cut["video-cut"] -.-> voiceover
 
-    subgraph understand[video-understanding]
-        direction LR
-        scene[场景切分] --- asr[ASR 对白] --- vlm[VLM 帧实] --- brief[Brief + 索引]
-    end
-
-    subgraph script[video-script · Agent 写 narration.json]
-        direction LR
-        write[撰写] --- review[评审] --- validate[校验时间]
-    end
-
-    cut[video-cut · 可选，剪辑模式]
-    subgraph produce[产出]
-        direction LR
-        voice[video-voiceover · MiMo TTS] --- assemble[video-assemble · 混音 + 压低 + 字幕]
-    end
-    output([Recap 视频])
-
-    understand --> script
-    script --> cut --> produce
-    script --> produce
-    produce --> output
-
-    classDef s fill:#eef6ff,stroke:#4f86c6,color:#1f2937;
-    classDef w fill:#f3ecff,stroke:#7c3aed,color:#1f2937;
-    classDef p fill:#ecfdf3,stroke:#16a34a,color:#1f2937;
-    class input,context,understand s;
-    class script,cut w;
-    class produce,output p;
+    classDef io fill:#eef6ff,stroke:#4f86c6,color:#1f2937;
+    classDef opt fill:#f3f4f6,stroke:#9ca3af,color:#374151;
+    class video,output io;
+    class research,cut opt;
 ```
 
 ## 架构
@@ -74,7 +55,7 @@ flowchart TB
 
 一个 key 跑全程。ASR、VLM、TTS 都走小米 MiMo 的 OpenAI 兼容接口，本地只要 `ffmpeg`，不用 GPU 也不用下模型，三个平台都能用。
 
-先查资料再写稿。把剧情、人物、关系、世界观先写进 brief，免得解说全靠看图猜。
+先调研再分析。把剧情、人物、关系先查清楚写进 `background_research.json`，理解阶段的 VLM 就能照着叫出人名、带着剧情读画面，而不是把人都标成「黑衣男子」。
 
 看得懂画面也听得到对白。`mimo-v2.5-asr` 转写对白，配上场景切分和 `mimo-v2.5` 的画面描述、帧级动作。
 

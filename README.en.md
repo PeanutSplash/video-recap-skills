@@ -21,38 +21,19 @@ https://github.com/user-attachments/assets/92698ec6-0d23-4f9f-8825-c3684ef57aff
 The whole pipeline runs on ffmpeg and a single [Xiaomi MiMo](https://platform.xiaomimimo.com) API key: speech-to-text, vision understanding, and text-to-speech all go through MiMo. There is no GPU to manage, nothing to download, and no extra service to run, on macOS, Linux, or Windows.
 
 ```mermaid
-flowchart TB
-    input([Input video]) --> understand
-    context[[Story research / context]] -.-> script
+flowchart TD
+    research["Story research<br/>background_research.json"] --> understand
+    video(["Input video"]) --> understand["video-understanding<br/>scenes · ASR · VLM · brief"]
+    understand --> script["video-script<br/>agent writes narration.json"]
+    script --> voiceover["video-voiceover<br/>MiMo TTS"]
+    voiceover --> assemble["video-assemble<br/>mux · duck · subtitles"]
+    assemble --> output(["Recap video"])
+    script -. cut mode .-> cut["video-cut"] -.-> voiceover
 
-    subgraph understand[video-understanding]
-        direction LR
-        scene[Scene cuts] --- asr[ASR dialogue] --- vlm[VLM frame facts] --- brief[Brief + index]
-    end
-
-    subgraph script[video-script · the agent writes narration.json]
-        direction LR
-        write[Write] --- review[Review] --- validate[Validate timing]
-    end
-
-    cut[video-cut · optional, cut mode]
-    subgraph produce[produce]
-        direction LR
-        voice[video-voiceover · MiMo TTS] --- assemble[video-assemble · mux + duck + subtitles]
-    end
-    output([Recap video])
-
-    understand --> script
-    script --> cut --> produce
-    script --> produce
-    produce --> output
-
-    classDef s fill:#eef6ff,stroke:#4f86c6,color:#1f2937;
-    classDef w fill:#f3ecff,stroke:#7c3aed,color:#1f2937;
-    classDef p fill:#ecfdf3,stroke:#16a34a,color:#1f2937;
-    class input,context,understand s;
-    class script,cut w;
-    class produce,output p;
+    classDef io fill:#eef6ff,stroke:#4f86c6,color:#1f2937;
+    classDef opt fill:#f3f4f6,stroke:#9ca3af,color:#374151;
+    class video,output io;
+    class research,cut opt;
 ```
 
 ## Architecture
@@ -74,7 +55,7 @@ Each skill ships its own `lib.py` with its config and helpers. There is no share
 
 **One key, runs anywhere.** ASR, VLM, and TTS all hit MiMo's OpenAI-compatible API, so the only thing you install locally is ffmpeg. No GPU, no model files.
 
-**Research before writing.** Plot, characters, relationships, and world context go into the brief, so the narration is grounded instead of guesswork over the pictures.
+**Research before analysis.** Put the plot, characters, and relationships into `background_research.json` first; the VLM reads scenes with that knowledge and names people, instead of labelling everyone "黑衣男子".
 
 **It reads the screen and hears the dialogue.** `mimo-v2.5-asr` transcribes speech; `mimo-v2.5` describes each scene and its frame-level actions, lined up with the scene cuts.
 
