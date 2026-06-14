@@ -16,6 +16,9 @@ bundle ships no root `CLAUDE.md` (so it never collides with your project/global 
 | TTS model | `MIMO_TTS_MODEL` | `mimo-v2.5-tts` | the only TTS engine |
 | MiMo voice | `MIMO_TTS_VOICE` / `--mimo-tts-voice` | `冰糖` | |
 | Narration density | `TARGET_SEGMENTS_PER_MINUTE` | `9.6` | min `MIN_SEGMENTS_PER_MINUTE=6.24` |
+| Narration speed | `NARRATION_SPEED` | `1.0` | global atempo on the voiceover; `1.1`–`1.2` is snappier for short-form |
+| Mask source subs | `MASK_SOURCE_SUBTITLES` / `SOURCE_SUBTITLE_MASK_RATIO` | off / `0.14` | cover burned-in source subtitles (bottom band) so only the recap's subtitles show |
+| Ducking level | `DUCKING_ORIG_VOLUME` / `SPEECH_DUCKING_VOLUME` | `0.5` / `0.2` | lower = original audio quieter under narration |
 | Final loudness | `FINAL_LOUDNORM` / `TARGET_LUFS` | `true` / `-14` | end-of-pipeline normalize |
 | Style | `--style` | `纪录片` | |
 | Edit mode | `EDIT_MODE` / `--edit-mode` | `full` | `full` or `cut` |

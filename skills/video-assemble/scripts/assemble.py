@@ -227,6 +227,47 @@ def final_loudnorm_filter():
     )
 
 
+def _apply_narration_speed(tts_segments, work_dir):
+    """Globally speed up narration audio via atempo (CONFIG['narration_speed']).
+
+    MiMo TTS reads a touch slowly for short-form recaps; a 1.1-1.2x bump makes it
+    snappier without the chipmunk effect. Rewrites each segment's audio_path/duration
+    to the sped copy so the rest of assembly is unchanged. No-op at speed 1.0.
+    """
+    speed = float(CONFIG.get("narration_speed", 1.0) or 1.0)
+    if abs(speed - 1.0) <= 1e-3:
+        return
+    factor = max(0.5, min(2.0, speed))
+    done = 0
+    for seg in tts_segments:
+        src = seg.get("audio_path")
+        if not src or not os.path.exists(src):
+            continue
+        out = str(Path(work_dir) / f"_spd_{seg.get('index', 0)}.wav")
+        res = run_cmd(["ffmpeg", "-y", "-i", src, "-filter:a", f"atempo={factor:.3f}",
+                       "-ar", "44100", "-ac", "1", "-acodec", "pcm_s16le", out])
+        if res.returncode == 0 and os.path.exists(out):
+            seg["audio_path"] = out
+            seg["audio_duration"] = get_video_duration(out)
+            done += 1
+    log(f"解说整体提速: atempo={factor:.2f} ({done} 段)")
+
+
+def _source_subtitle_mask_filter():
+    """ffmpeg drawbox that masks burned-in source subtitles along the bottom, or None.
+
+    Many source videos (e.g. 庆余年) ship hardcoded subtitles; without this the recap
+    shows the original subs AND our narration subs stacked. Covers the bottom band with
+    an opaque box; our subtitles render on top of it.
+    """
+    if not CONFIG.get("mask_source_subtitles", False):
+        return None
+    ratio = max(0.0, min(0.5, float(CONFIG.get("source_subtitle_mask_ratio", 0.14) or 0.0)))
+    if ratio <= 0:
+        return None
+    return f"drawbox=x=0:y=ih-ih*{ratio:.3f}:w=iw:h=ih*{ratio:.3f}:color=black@1.0:t=fill"
+
+
 def _seg_place_window(seg):
     """Return a segment's actual placed (start, end) on the output timeline."""
     s = seg.get("actual_place_start", seg.get("start", 0))
@@ -333,7 +374,8 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
 
     video_duration = get_video_duration(input_video)
 
-    # 将所有 TTS 片段按时间位置合成到与视频等长的音轨上
+    # 解说整体提速（可选）后，将所有 TTS 片段按时间位置合成到与视频等长的音轨上
+    _apply_narration_speed(tts_segments, work_dir)
     narration_wav = work_dir / "narration.wav"
     _build_timed_narration(tts_segments, narration_wav, video_duration, work_dir)
 
@@ -378,9 +420,18 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
             "-map", "0:v", "-map", aout_label,
         ]
 
+    # Video filter chain: mask source subtitles first (drawbox), then burn our subtitles
+    # on top. Either one forces a re-encode; with neither, the video stream is copied.
+    vf_chain = []
+    mask_filter = _source_subtitle_mask_filter()
+    if mask_filter:
+        vf_chain.append(mask_filter)
     if CONFIG.get("burn_subtitles", False):
-        cmd += ["-vf", _subtitle_burn_filter(ass_path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
-        log("压制解说字幕（ASS，需要重编码）...")
+        vf_chain.append(_subtitle_burn_filter(ass_path))
+    if vf_chain:
+        cmd += ["-vf", ",".join(vf_chain), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+        notes = ([] + (["遮挡原字幕"] if mask_filter else []) + (["压制解说字幕"] if CONFIG.get("burn_subtitles", False) else []))
+        log("视频重编码: " + " + ".join(notes))
     elif CONFIG.get("force_video_reencode", False):
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
     else:

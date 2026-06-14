@@ -3,8 +3,57 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'skills' / 'video-assemble' / 'scripts'))
 import pytest  # noqa: F401
 from subprocess import CompletedProcess  # noqa: F401
-from assemble import _build_audio_filter_complex, _build_timed_narration, _escape_ass_text, _generate_ass, _generate_srt, _seconds_to_ass_time, _seconds_to_srt_time, _subtitle_burn_filter, assemble_video, assembly_settings_fingerprint, final_loudnorm_filter
+from assemble import _apply_narration_speed, _build_audio_filter_complex, _build_timed_narration, _escape_ass_text, _generate_ass, _generate_srt, _seconds_to_ass_time, _seconds_to_srt_time, _source_subtitle_mask_filter, _subtitle_burn_filter, assemble_video, assembly_settings_fingerprint, final_loudnorm_filter
 from lib import CONFIG
+
+
+def test_source_subtitle_mask_filter_toggles_with_config(monkeypatch):
+    monkeypatch.setitem(CONFIG, "mask_source_subtitles", False)
+    assert _source_subtitle_mask_filter() is None
+
+    monkeypatch.setitem(CONFIG, "mask_source_subtitles", True)
+    monkeypatch.setitem(CONFIG, "source_subtitle_mask_ratio", 0.15)
+    f = _source_subtitle_mask_filter()
+    assert f is not None and f.startswith("drawbox=") and "0.150" in f and "t=fill" in f
+
+    monkeypatch.setitem(CONFIG, "source_subtitle_mask_ratio", 0.0)  # ratio 0 -> no mask
+    assert _source_subtitle_mask_filter() is None
+
+
+def test_apply_narration_speed_atempos_each_segment(monkeypatch, tmp_path):
+    src = tmp_path / "narr_000.wav"
+    src.write_bytes(b"RIFFwav")
+    segs = [{"index": 0, "audio_path": str(src), "audio_duration": 5.0}]
+    cmds = []
+
+    def fake_run_cmd(cmd, **kw):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"sped")
+        return CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setitem(CONFIG, "narration_speed", 1.12)
+    monkeypatch.setattr("assemble.run_cmd", fake_run_cmd)
+    monkeypatch.setattr("assemble.get_video_duration", lambda p: 4.46)
+
+    _apply_narration_speed(segs, tmp_path)
+
+    assert any("atempo=1.120" in " ".join(c) for c in cmds)
+    assert segs[0]["audio_path"].endswith("_spd_0.wav")
+    assert segs[0]["audio_duration"] == 4.46
+
+
+def test_apply_narration_speed_noop_at_1x(monkeypatch, tmp_path):
+    src = tmp_path / "narr_000.wav"
+    src.write_bytes(b"x")
+    segs = [{"index": 0, "audio_path": str(src), "audio_duration": 5.0}]
+
+    def boom(*a, **k):
+        raise AssertionError("must not re-encode at speed 1.0")
+
+    monkeypatch.setitem(CONFIG, "narration_speed", 1.0)
+    monkeypatch.setattr("assemble.run_cmd", boom)
+    _apply_narration_speed(segs, tmp_path)
+    assert segs[0]["audio_path"] == str(src)  # unchanged
 
 
 def test_seconds_to_srt_time():

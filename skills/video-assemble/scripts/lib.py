@@ -198,9 +198,12 @@ CONFIG = {
     "ducking_level_sc": 2.0,
     "ducking_makeup": 1.2,
     "ducking_narr_weight": 1.5,
-    "ducking_orig_volume": 0.5,
+    "ducking_orig_volume": env_float("DUCKING_ORIG_VOLUME", 0.5, minimum=0.0),  # 解说时原声基准音量
     "zone_ducking_volume": 0.12,    # 解说时原声压低到的音量
     "zone_fade_seconds": 0.5,      # 解说/原声切换的淡入淡出时长(秒)
+    "narration_speed": env_float("NARRATION_SPEED", 1.0, minimum=0.5),  # 解说整体提速(atempo)，1.1~1.2 更适合短视频
+    "mask_source_subtitles": env_bool("MASK_SOURCE_SUBTITLES", False),  # 遮挡原片烧录字幕
+    "source_subtitle_mask_ratio": env_float("SOURCE_SUBTITLE_MASK_RATIO", 0.14, minimum=0.0),  # 底部遮挡比例
     "narration_delay_seconds": 1.5,  # 解说延迟放置秒数，让画面先出现再解说
     "narration_tail_pad_seconds": 0.1,  # 解说尾部最少留白；短 slot 会自动压低 delay 避免截断
     "quiet_overlap_min_ratio": 0.8,  # 解说段至少多少比例落在安静窗口内才标记为非对白重叠
@@ -208,7 +211,7 @@ CONFIG = {
     "visual_beat_max_facts": 3,  # 单段解说最多建议覆盖的 frame_facts 锚点数量
     "asr_chunk_min_chars": env_int("ASR_CHUNK_MIN_CHARS", 500, minimum=1),  # brief 中 ASR 写作分块最小字数/词数
     "asr_chunk_max_chars": env_int("ASR_CHUNK_MAX_CHARS", 800, minimum=1),  # brief 中 ASR 写作分块最大字数/词数
-    "speech_ducking_volume": 0.2,    # 解说与对白重叠时原声音量
+    "speech_ducking_volume": env_float("SPEECH_DUCKING_VOLUME", 0.2, minimum=0.0),    # 解说与对白重叠时原声音量
     "silence_noise_threshold": "-25dB",  # ffmpeg silencedetect 噪声阈值
     "silence_min_duration": 0.3,     # 静音最短持续秒数
     "quiet_window_min": 1.0,         # 可放解说的安静窗口最短秒数
