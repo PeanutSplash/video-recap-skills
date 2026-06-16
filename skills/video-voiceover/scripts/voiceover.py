@@ -178,11 +178,11 @@ def synthesize_tts(narration, work_dir):
             except Exception as e:
                 i = futures[future]
                 failures.append((i, str(e)))
-                log(f"  TTS 段 {i+1} 失败: {e}")
+                log(f"  TTS 段 {i+1}/{len(narration)} 失败: {e}")
                 continue
             if result:
                 segments.append(result)
-                log(f"  段 {result['index']+1}: {result['audio_duration']:.1f}s - {result['narration'][:25]}...")
+                log(f"  段 {result['index']+1}/{len(narration)}: {result['audio_duration']:.1f}s - {result['narration'][:25]}...")
 
     segments.sort(key=lambda x: x["index"])
     if failures and not CONFIG.get("allow_partial_tts", False):

@@ -317,6 +317,8 @@ def test_assemble_video_burns_ass_subtitles(monkeypatch, tmp_path):
 
     def fake_run_cmd(cmd):
         commands.append(cmd)
+        if cmd and cmd[0] == "ffmpeg" and "-filters" in cmd:
+            return CompletedProcess(cmd, 0, stdout="... subtitles ...", stderr="")
         output.write_bytes(b"mp4")
         return CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -339,8 +341,11 @@ def test_assemble_video_burns_ass_subtitles(monkeypatch, tmp_path):
     ffmpeg_cmd = commands[-1]
     assert (tmp_path / "subtitles.srt").exists()
     assert (tmp_path / "subtitles.ass").exists()
-    assert "-vf" in ffmpeg_cmd
-    assert any(str(arg).startswith("subtitles=") for arg in ffmpeg_cmd)
+    # Fix 3 merged -vf into -filter_complex; subtitles filter is now inside the graph
+    fc_idx = ffmpeg_cmd.index("-filter_complex") if "-filter_complex" in ffmpeg_cmd else None
+    assert fc_idx is not None or "-/filter_complex" in ffmpeg_cmd
+    fc_content = ffmpeg_cmd[fc_idx + 1] if fc_idx is not None else ""
+    assert "subtitles=" in fc_content
     assert "-c:v" in ffmpeg_cmd
     assert "libx264" in ffmpeg_cmd
 
@@ -438,8 +443,11 @@ def test_assemble_video_masks_source_subs_by_default(monkeypatch, tmp_path):
     }], tmp_path, output)
 
     ffmpeg_cmd = commands[-1]
-    assert "-vf" in ffmpeg_cmd
-    assert any("drawbox=" in str(arg) for arg in ffmpeg_cmd)
+    # Fix 3 merged -vf into -filter_complex; drawbox is now inside the graph
+    fc_idx = ffmpeg_cmd.index("-filter_complex") if "-filter_complex" in ffmpeg_cmd else None
+    assert fc_idx is not None or "-/filter_complex" in ffmpeg_cmd
+    fc_content = ffmpeg_cmd[fc_idx + 1] if fc_idx is not None else ""
+    assert "drawbox=" in fc_content
     assert ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
 
 

@@ -2,11 +2,13 @@ import base64
 import json
 import mimetypes
 import re
+import threading
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib import CONFIG
-from lib import log, api_call, load_prompt, mimo_video_api_call, run_cmd, file_fingerprint, stable_hash
+from lib import log, api_call, load_prompt, mimo_video_api_call, run_cmd, file_fingerprint, stable_hash, rate_limit_tracker
 
 # ── Step 4: VLM 视觉分析 ─────────────────────────────────────────────
 
@@ -90,8 +92,53 @@ def analyze_scenes(scenes, frames, work_dir):
             b64_cache[frame_path] = base64.b64encode(frame_path.read_bytes()).decode()
         return b64_cache[frame_path]
 
+    # ── 自适应并发控制 ──────────────────────────────────────────────
+    concurrency_lock = threading.Lock()
+    initial_workers = min(len(scenes), CONFIG.get("vlm_workers", 8))
+    current_workers = [initial_workers]
+    concurrency_sem = threading.Semaphore(initial_workers)
+    consecutive_ok = [0]
+
+    def _reduce_concurrency():
+        """当 429 频繁时，将并发数减半（最小 1）。"""
+        with concurrency_lock:
+            old = current_workers[0]
+            if old <= 1:
+                return
+            new = max(1, old // 2)
+            current_workers[0] = new
+            consecutive_ok[0] = 0
+            log(f"API 限流频繁，降低并行数: {old} -> {new}")
+            for _ in range(old - new):
+                concurrency_sem.acquire(blocking=False)
+
+    def _try_restore_concurrency():
+        """连续多个场景未 429 时，逐步恢复到初始并发。"""
+        with concurrency_lock:
+            consecutive_ok[0] += 1
+            old = current_workers[0]
+            if old >= initial_workers or consecutive_ok[0] < 5:
+                return
+            new = min(initial_workers, old + 1)
+            current_workers[0] = new
+            consecutive_ok[0] = 0
+            concurrency_sem.release()
+            log(f"API 限流缓解，恢复并行数: {old} -> {new}")
+
     def _analyze_single_scene(i, scene):
         """分析单个场景，返回 (scene_id, result_dict)"""
+        concurrency_sem.acquire()
+        try:
+            result = _analyze_single_scene_inner(i, scene)
+            _try_restore_concurrency()
+            return result
+        finally:
+            concurrency_sem.release()
+            if rate_limit_tracker.should_reduce_concurrency():
+                _reduce_concurrency()
+
+    def _analyze_single_scene_inner(i, scene):
+        """分析单个场景的核心逻辑"""
         scene_frames = [f for f, t in frame_times.items()
                         if scene["start"] <= t <= scene["end"]]
         if not scene_frames:
@@ -133,7 +180,32 @@ def analyze_scenes(scenes, frames, work_dir):
 
         raw_response = ""
         for attempt in range(3):
-            resp = api_call(payload)
+            try:
+                resp = api_call(payload)
+            except RuntimeError as api_err:
+                err_msg = str(api_err)
+                # HTTP 400 可能是损坏的帧数据，尝试去掉一帧后重试
+                if "400" in err_msg and len(scene_frames) > 1:
+                    log(f"  场景 {i+1} API 400 错误，尝试去掉最后一帧重试...")
+                    scene_frames = scene_frames[:-1]
+                    content_parts = []
+                    for f in scene_frames:
+                        b64 = _get_b64(f)
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                        })
+                    frame_ts_list = [f"{frame_times[f]:.1f}s" for f in scene_frames]
+                    frame_ts_text = "帧时间点: " + ", ".join(frame_ts_list)
+                    content_parts.append({"type": "text", "text": frame_ts_text + "\n\n" + vlm_prompt})
+                    payload = {
+                        "model": CONFIG["vlm_model"],
+                        "messages": [{"role": "user", "content": content_parts}],
+                        "max_tokens": 800,
+                    }
+                    continue
+                raise
+
             try:
                 msg = resp["choices"][0]["message"]
                 raw_response = (msg.get("content") or msg.get("reasoning_content") or "")
@@ -171,12 +243,14 @@ def analyze_scenes(scenes, frames, work_dir):
 
         return i, result
 
-    # 并行调用 VLM
+    # ── 并行调用 VLM（自适应并发） ──────────────────────────────────
     analyses = [None] * len(scenes)
-    max_workers = min(len(scenes), CONFIG.get("vlm_workers", 4))
-    log(f"VLM 并行分析 {len(scenes)} 个场景 (workers={max_workers})...")
+    rate_limit_tracker.reset()
+    log(f"VLM 并行分析 {len(scenes)} 个场景 (workers={initial_workers})...")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # 线程池大小固定为初始值，实际并发由 concurrency_sem 动态控制
+    pool_size = initial_workers
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
         futures = {executor.submit(_analyze_single_scene, i, s): i for i, s in enumerate(scenes)}
         failures = []
         for future in as_completed(futures):

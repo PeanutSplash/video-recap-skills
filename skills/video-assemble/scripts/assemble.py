@@ -548,6 +548,31 @@ def _coalesce_duck_windows(windows, bridge):
     return merged
 
 
+_DUCK_CHUNK_SIZE = 50  # merged windows per volume filter node (avoids ffmpeg expr overflow)
+
+
+def _chunk_envelope_exprs(merged, baseline, term_for):
+    """Build a list of volume= expressions from merged windows.
+
+    When `len(merged) <= _DUCK_CHUNK_SIZE`, returns a single-element list with the full
+    expression starting at `baseline`. Otherwise splits the windows into chunks: the first
+    chunk starts at `baseline`, subsequent chunks default to 1.0 (pass-through) and only dip
+    for their own windows. Chaining the chunks as sequential `volume=` filters multiplies
+    them, reproducing the combined envelope. `term_for(s, e, level)` builds one '+'-term."""
+    if not merged:
+        return None
+    if len(merged) <= _DUCK_CHUNK_SIZE:
+        terms = [term_for(s, e, level) for s, e, level in merged]
+        return [f"max(0,min(1,{baseline}{''.join(terms)}))"]
+    chunks = []
+    for i in range(0, len(merged), _DUCK_CHUNK_SIZE):
+        group = merged[i:i + _DUCK_CHUNK_SIZE]
+        start = baseline if i == 0 else "1.0"
+        terms = [term_for(s, e, level) for s, e, level in group]
+        chunks.append(f"max(0,min(1,{start}{''.join(terms)}))")
+    return chunks
+
+
 def _duck_envelope(tts_segments, idle, speech_vol, quiet_vol, fade, bridge=None):
     """Per-beat ducking automation for the ORIGINAL track.
 
@@ -555,31 +580,50 @@ def _duck_envelope(tts_segments, idle, speech_vol, quiet_vol, fade, bridge=None)
     beat overlaps source dialogue, quiet_vol where it sits in a quiet window — and HOLDS
     that duck across inter-beat gaps shorter than `bridge` so the source dialogue does not
     pop back up between sentences. Only gaps >= bridge swell back to `idle` (lead-in/out
-    and deliberate long pauses). Returns a volume= expression, or None when no beat carries
-    placement info (caller falls back to a constant)."""
+    and deliberate long pauses). Returns a LIST of volume= expressions (one per chunk; a
+    single element for short videos), or None when no beat carries placement info (caller
+    falls back to a constant)."""
     if bridge is None:
         bridge = 2 * float(fade or 0)
     windows = _placement_windows(
         tts_segments, lambda seg: speech_vol if seg.get("overlaps_speech", True) else quiet_vol)
     merged = _coalesce_duck_windows(windows, bridge)
-    if not merged:
-        return None
-    terms = [f"+({level - idle:.3f})*{_duck_ramp(s, e, fade)}" for s, e, level in merged]
-    return f"max(0,min(1,{idle}{''.join(terms)}))"
+    return _chunk_envelope_exprs(
+        merged, idle, lambda s, e, level: f"+({level - idle:.3f})*{_duck_ramp(s, e, fade)}")
 
 
 def _bgm_envelope(tts_segments, base, duck, fade, bridge=None):
     """Per-beat ducking automation for the BGM track: hold the bed at `base`, dip to
     `duck` under each narration window (held across gaps < `bridge`) so the voice stays
-    clear. None if no beats."""
+    clear. Returns a LIST of volume= expressions (one per chunk), or None if no beats."""
     if bridge is None:
         bridge = 2 * float(fade or 0)
     windows = _placement_windows(tts_segments, lambda seg: duck)
     merged = _coalesce_duck_windows(windows, bridge)
-    if not merged:
-        return None
-    terms = [f"+({lvl - base:.3f})*{_duck_ramp(s, e, fade)}" for s, e, lvl in merged]
-    return f"max(0,min(1,{base}{''.join(terms)}))"
+    return _chunk_envelope_exprs(
+        merged, base, lambda s, e, lvl: f"+({lvl - base:.3f})*{_duck_ramp(s, e, fade)}")
+
+
+def _chain_volume_nodes(in_label, exprs, name, tail):
+    """Chain one or more `volume=...:eval=frame` filter nodes into a single [name] output.
+
+    With one expression: `[in]volume='expr':eval=frame,{tail}[name];`. With several
+    (chunked envelope), each becomes its own node feeding the next, multiplying their
+    envelopes; `tail` (e.g. aresample/aformat) runs on the last node:
+    `[in]volume='e0':eval=frame[name_v0];[name_v0]volume='e1':eval=frame,{tail}[name];`"""
+    if len(exprs) == 1:
+        return f"{in_label}volume='{exprs[0]}':eval=frame,{tail}[{name}];"
+    parts = []
+    prev = in_label
+    last = len(exprs) - 1
+    for ci, expr in enumerate(exprs):
+        if ci == last:
+            parts.append(f"{prev}volume='{expr}':eval=frame,{tail}[{name}];")
+        else:
+            out = f"[{name}_v{ci}]"
+            parts.append(f"{prev}volume='{expr}':eval=frame{out};")
+            prev = out
+    return "".join(parts)
 
 
 def _build_audio_filter_complex(
@@ -611,17 +655,19 @@ def _build_audio_filter_complex(
     bgm_chain = ""
     if has_bgm:
         base = CONFIG.get("bgm_volume", 0.18)
-        bgm_expr = _bgm_envelope(tts_segments, base, CONFIG.get("bgm_ducking_volume", 0.10), fade,
-                                 bridge=CONFIG.get("duck_bridge_seconds", 12.0))
-        if bgm_expr:
-            bgm_chain = f"{bgm_in}volume='{bgm_expr}':eval=frame,aresample=48000[bgm];"
+        bgm_exprs = _bgm_envelope(tts_segments, base, CONFIG.get("bgm_ducking_volume", 0.10), fade,
+                                  bridge=CONFIG.get("duck_bridge_seconds", 12.0))
+        if bgm_exprs:
+            bgm_chain = _chain_volume_nodes(
+                bgm_in, bgm_exprs, "bgm",
+                tail="aresample=48000,aformat=channel_layouts=stereo")
         else:
-            bgm_chain = f"{bgm_in}volume={base},aresample=48000[bgm];"
+            bgm_chain = f"{bgm_in}volume={base},aresample=48000,aformat=channel_layouts=stereo[bgm];"
 
     if ducking_mode == "sidechaincompress":
         # The narration keys the compressor; split it so it can also be mixed in.
         head = (
-            f"{original_in}aresample=48000[o0];"
+            f"{original_in}aresample=48000,aformat=channel_layouts=stereo[o0];"
             "[1:a]aresample=48000,asplit=2[sckey][scnarr];"
             f"[o0][sckey]sidechaincompress="
             f"threshold={CONFIG['ducking_threshold']}:ratio={CONFIG['ducking_ratio']}"
@@ -634,22 +680,26 @@ def _build_audio_filter_complex(
         return head + narr + "[orig][narr]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
 
     if ducking_mode == "none":
-        return f"{original_in}aresample=48000[orig];" + _amix_tail(narr_vol, bgm_chain)
+        return f"{original_in}aresample=48000,aformat=channel_layouts=stereo[orig];" + _amix_tail(narr_vol, bgm_chain)
 
     # fixed (default): gap-fill ducking envelope on the original track.
     idle = CONFIG.get("idle_orig_volume", 0.85)
     speech_vol = CONFIG.get("speech_ducking_volume", 0.2)
     quiet_vol = CONFIG.get("zone_ducking_volume", 0.12)
     bridge = CONFIG.get("duck_bridge_seconds", 12.0)
-    expr = _duck_envelope(tts_segments, idle, speech_vol, quiet_vol, fade, bridge=bridge)
-    if expr:
+    exprs = _duck_envelope(tts_segments, idle, speech_vol, quiet_vol, fade, bridge=bridge)
+    if exprs:
         n_overlap = sum(1 for s in tts_segments if isinstance(s, dict) and s.get("overlaps_speech", True))
         n_quiet = sum(1 for s in tts_segments if isinstance(s, dict) and not s.get("overlaps_speech", True))
         log(f"gap-fill ducking: 间隙原声={idle}, 对白段={speech_vol}({n_overlap}), 安静段={quiet_vol}({n_quiet}), 桥接间隙<{bridge}s")
-        orig = f"{original_in}volume='{expr}':eval=frame,aresample=48000[orig];"
+        if len(exprs) > 1:
+            log(f"  ducking 分块: {len(exprs)} 个 volume 节点 (每块 ≤{_DUCK_CHUNK_SIZE} 段)")
+        orig = _chain_volume_nodes(
+            original_in, exprs, "orig",
+            tail="aresample=48000,aformat=channel_layouts=stereo")
     else:
         # No placement info at all: hold the original at a constant level.
-        orig = f"{original_in}volume={CONFIG.get('ducking_orig_volume', 0.3)},aresample=48000[orig];"
+        orig = f"{original_in}volume={CONFIG.get('ducking_orig_volume', 0.3)},aresample=48000,aformat=channel_layouts=stereo[orig];"
     return orig + _amix_tail(narr_vol, bgm_chain)
 
 
@@ -657,6 +707,16 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
     """组装最终视频"""
     if not tts_segments:
         raise RuntimeError("tts_meta.json 没有有效解说音频，已中止以避免生成无解说视频")
+
+    # Early check: burning subtitles needs ffmpeg's libass/subtitles filter; fail before
+    # doing expensive TTS/narration work rather than after.
+    if CONFIG.get("burn_subtitles", False):
+        probe = run_cmd(["ffmpeg", "-filters"])
+        if probe.returncode != 0 or "subtitles" not in (probe.stdout or ""):
+            raise SystemExit(
+                "ffmpeg 缺少 libass/subtitles 滤镜，无法压制字幕。"
+                "请安装支持 libass 的 ffmpeg（如 brew install ffmpeg）或关闭 --burn-subtitles。"
+            )
 
     video_duration = get_video_duration(input_video)
 
@@ -705,7 +765,6 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
         bgm_audio_label=bgm_audio_label,
     )
 
-    # 对于超长 volume 表达式（多段解说），使用 -filter_complex_script 避免命令行溢出
     # 末端整体响度归一：ducking 只管相对平衡，这一步统一成片绝对响度
     aout_label = "[aout]"
     final_ln = final_loudnorm_filter()
@@ -718,47 +777,53 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
     # duration=first + -t trim it back to the video length).
     bgm_input = ["-stream_loop", "-1", "-i", str(bgm_path)] if has_bgm else []
 
-    filter_complex_bytes = filter_complex.encode('utf-8')
-    if len(filter_complex_bytes) > 8000:
-        fc_script = Path(work_dir) / ".filter_complex.txt"
-        fc_script.write_text(filter_complex, encoding="utf-8")
-        log(f"使用 filter_complex_script (表达式长度 {len(filter_complex_bytes)} bytes)")
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_video),
-            "-i", str(narration_wav),
-            *original_audio_input,
-            *bgm_input,
-            "-filter_complex_script", str(fc_script),
-            "-map", "0:v", "-map", aout_label,
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_video),
-            "-i", str(narration_wav),
-            *original_audio_input,
-            *bgm_input,
-            "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", aout_label,
-        ]
-
     # Video filter chain: mask source subtitles first (drawbox), then burn our subtitles
-    # on top. Either one forces a re-encode; with neither, the video stream is copied.
+    # on top. When present, fold it into filter_complex ([0:v]...[vout]) and map [vout];
+    # mixing a separate -vf with -filter_complex conflicts in modern ffmpeg. With neither,
+    # the video stream is copied (or re-encoded only when force_video_reencode is set).
     vf_chain = []
     mask_filter = _source_subtitle_mask_filter()
     if mask_filter:
         vf_chain.append(mask_filter)
     if CONFIG.get("burn_subtitles", False):
         vf_chain.append(_subtitle_burn_filter(ass_path))
+
     if vf_chain:
-        cmd += ["-vf", ",".join(vf_chain), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+        vf_str = ",".join(vf_chain)
+        filter_complex = f"[0:v]{vf_str}[vout];" + filter_complex
+        video_map = "[vout]"
+        video_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
         notes = ([] + (["遮挡原字幕"] if mask_filter else []) + (["压制解说字幕"] if CONFIG.get("burn_subtitles", False) else []))
         log("视频重编码: " + " + ".join(notes))
     elif CONFIG.get("force_video_reencode", False):
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+        video_map = "0:v"
+        video_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
     else:
-        cmd += ["-c:v", "copy"]
+        video_map = "0:v"
+        video_codec = ["-c:v", "copy"]
+
+    # 对于超长 filter_complex（多段解说 / 视频滤镜），写入文件并用 -/filter_complex 读取，
+    # 避免命令行参数溢出（-/filter_complex 从文件读取滤镜图，取代已废弃的 -filter_complex_script）。
+    filter_complex_bytes = filter_complex.encode('utf-8')
+    use_fc_file = len(filter_complex_bytes) > 8000
+    if use_fc_file:
+        fc_script = Path(work_dir) / ".filter_complex.txt"
+        fc_script.write_text(filter_complex, encoding="utf-8")
+        log(f"使用 -/filter_complex (表达式长度 {len(filter_complex_bytes)} bytes)")
+        fc_args = ["-/filter_complex", str(fc_script)]
+    else:
+        fc_args = ["-filter_complex", filter_complex]
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_video),
+        "-i", str(narration_wav),
+        *original_audio_input,
+        *bgm_input,
+        *fc_args,
+        "-map", video_map, "-map", aout_label,
+        *video_codec,
+    ]
 
     cmd += ["-c:a", "aac", "-b:a", "192k", "-t", str(video_duration), str(output_path)]
     try:
@@ -767,7 +832,7 @@ def assemble_video(input_video, tts_segments, work_dir, output_path):
             raise RuntimeError(f"视频组装失败: {result.stderr}")
     finally:
         # 清理临时 filter_complex 脚本（无论 ffmpeg 是否成功）
-        if len(filter_complex_bytes) > 8000:
+        if use_fc_file:
             fc_script.unlink(missing_ok=True)
 
     log(f"最终视频: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f}MB)")

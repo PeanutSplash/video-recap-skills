@@ -3,8 +3,10 @@ Merged from the shared core; reads the same env vars as the rest of the bundle."
 import json
 import hashlib
 import os
+import random
 import re
 import subprocess
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -426,7 +428,49 @@ def mimo_asr_api_call(payload, max_retries=10):
     """Call the MiMo speech-recognition (ASR) endpoint."""
     return _call_mimo_endpoint("asr", payload, max_retries=max_retries)
 
-def api_call(payload, max_retries=8, *, api_provider=None, api_url=None, api_key=None, api_key_source=None):
+# ── 全局限流追踪 ─────────────────────────────────────────────────────
+
+class RateLimitTracker:
+    """Thread-safe tracker for 429 rate-limit events.
+
+    Used by analyze_scenes to adaptively reduce concurrency when the API
+    is returning too many 429 responses in a short window.
+    """
+
+    def __init__(self, window_seconds=30, threshold=3):
+        self._lock = threading.Lock()
+        self._timestamps: list[float] = []
+        self._window = window_seconds
+        self._threshold = threshold
+        self._reduction_requested = False
+
+    def record_429(self):
+        """Record a 429 event and return True if threshold is exceeded."""
+        now = time.monotonic()
+        with self._lock:
+            self._timestamps = [t for t in self._timestamps if now - t < self._window]
+            self._timestamps.append(now)
+            if len(self._timestamps) >= self._threshold:
+                self._reduction_requested = True
+                return True
+            return False
+
+    def should_reduce_concurrency(self):
+        """Check and clear the reduction-requested flag."""
+        with self._lock:
+            if self._reduction_requested:
+                self._reduction_requested = False
+                return True
+            return False
+
+    def reset(self):
+        with self._lock:
+            self._timestamps.clear()
+            self._reduction_requested = False
+
+rate_limit_tracker = RateLimitTracker()
+
+def api_call(payload, max_retries=5, *, api_provider=None, api_url=None, api_key=None, api_key_source=None):
     """调用 OpenAI-compatible API，带重试。
 
     长视频理解会发出数百次 VLM/ASR 调用，集群的 429 限流是常态而非错误，所以重试更耐心
@@ -437,7 +481,10 @@ def api_call(payload, max_retries=8, *, api_provider=None, api_url=None, api_key
     headers = _api_headers(api_provider=api_provider, api_url=endpoint, api_key=api_key)
     data = json.dumps(_prepare_api_payload(payload, api_provider=api_provider, api_url=endpoint)).encode("utf-8")
 
-    for attempt in range(max_retries):
+    effective_max_retries = max_retries
+    saw_429 = False
+
+    for attempt in range(effective_max_retries):
         try:
             req = urllib.request.Request(endpoint, data=data, headers=headers)
             with urllib.request.urlopen(req, timeout=300) as resp:
@@ -447,9 +494,17 @@ def api_call(payload, max_retries=8, *, api_provider=None, api_url=None, api_key
             body = e.read().decode("utf-8", errors="replace")[:500]
             wait = min(2 ** attempt, 60)
             if e.code == 429:
+                if not saw_429:
+                    saw_429 = True
+                    effective_max_retries = max(effective_max_retries, 7)
                 retry_after = e.headers.get("Retry-After")
-                wait = _retry_after_seconds(retry_after, max(wait, 10))
-                log(f"API 速率限制 (尝试 {attempt+1}/{max_retries}), 等待 {wait}s")
+                base_wait = _retry_after_seconds(retry_after, 2 ** attempt)
+                wait = min(base_wait + random.random(), 30)
+                log(f"API 速率限制 (尝试 {attempt+1}/{effective_max_retries}), 等待 {wait:.1f}s")
+                rate_limit_tracker.record_429()
+            elif e.code == 400:
+                log(f"API 请求错误 (400): {body[:200]}")
+                raise RuntimeError(f"API 请求错误 (400): {body}")
             elif e.code == 401:
                 key_name = api_key_source or CONFIG.get("api_key_source", "MIMO_API_KEY")
                 raise RuntimeError(f"API 认证失败 (401)。请检查 {key_name} 和 API URL 是否匹配。")
@@ -463,25 +518,25 @@ def api_call(payload, max_retries=8, *, api_provider=None, api_url=None, api_key
             elif e.code == 405:
                 raise RuntimeError("API 端点不可用 (405)，可能被 WAF 拦截。请检查 MIMO_API_URL 或稍后重试。")
             elif e.code == 503:
-                log(f"API 服务暂不可用 (503)，等待 {wait}s (尝试 {attempt+1}/{max_retries})")
+                log(f"API 服务暂不可用 (503)，等待 {wait}s (尝试 {attempt+1}/{effective_max_retries})")
             elif e.code == 524:
                 # Cloudflare 超时：服务端处理超时，需要更长退避
                 wait = max(wait, 4 * (attempt + 1))
-                log(f"API 超时 (524)，等待 {wait}s (尝试 {attempt+1}/{max_retries})")
+                log(f"API 超时 (524)，等待 {wait}s (尝试 {attempt+1}/{effective_max_retries})")
             else:
-                log(f"API 调用失败 (尝试 {attempt+1}/{max_retries}): HTTP {e.code} — {body}")
-            if attempt < max_retries - 1:
+                log(f"API 调用失败 (尝试 {attempt+1}/{effective_max_retries}): HTTP {e.code} — {body}")
+            if attempt < effective_max_retries - 1:
                 time.sleep(wait)
             else:
-                raise RuntimeError(f"API 调用失败 {max_retries} 次: HTTP {e.code} — {body}")
+                raise RuntimeError(f"API 调用失败 {effective_max_retries} 次: HTTP {e.code} — {body}")
         except (urllib.error.URLError, Exception) as e:
             wait = min(2 ** attempt, 60)
-            log(f"API 调用失败 (尝试 {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
+            log(f"API 调用失败 (尝试 {attempt+1}/{effective_max_retries}): {e}")
+            if attempt < effective_max_retries - 1:
                 log(f"等待 {wait}s 后重试...")
                 time.sleep(wait)
             else:
-                raise RuntimeError(f"API 调用失败 {max_retries} 次: {e}")
+                raise RuntimeError(f"API 调用失败 {effective_max_retries} 次: {e}")
 
 def load_prompt(name):
     """加载 prompt 模板"""
