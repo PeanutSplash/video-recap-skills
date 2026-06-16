@@ -8,7 +8,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib import CONFIG
-from lib import log, api_call, load_prompt, mimo_video_api_call, run_cmd, file_fingerprint, stable_hash, rate_limit_tracker
+from lib import log, api_call, load_prompt, mimo_video_api_call, run_cmd, file_fingerprint, stable_hash, rate_limit_tracker, key_pool
 
 # ── Step 4: VLM 视觉分析 ─────────────────────────────────────────────
 
@@ -94,7 +94,9 @@ def analyze_scenes(scenes, frames, work_dir):
 
     # ── 自适应并发控制 ──────────────────────────────────────────────
     concurrency_lock = threading.Lock()
-    initial_workers = min(len(scenes), CONFIG.get("vlm_workers", 8))
+    base_workers = CONFIG.get("vlm_workers", 8)
+    pool_multiplier = max(1, key_pool.total) if len(key_pool) > 0 else 1
+    initial_workers = min(len(scenes), base_workers * pool_multiplier)
     current_workers = [initial_workers]
     concurrency_sem = threading.Semaphore(initial_workers)
     consecutive_ok = [0]

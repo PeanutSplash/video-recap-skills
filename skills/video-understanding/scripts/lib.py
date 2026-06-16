@@ -406,6 +406,20 @@ def _mimo_endpoint(kind):
     }
 
 def _call_mimo_endpoint(kind, payload, max_retries=10):
+    if len(key_pool) > 0:
+        pick = key_pool.next()
+        if pick is None:
+            raise RuntimeError("所有 API key 均不可用")
+        api_key, api_url, pool_idx = pick
+        return api_call(
+            payload,
+            max_retries=max_retries,
+            api_provider="mimo",
+            api_url=api_url,
+            api_key=api_key,
+            api_key_source=f"MIMO_API_KEYS[{pool_idx}]",
+            _pool_idx=pool_idx,
+        )
     settings = _mimo_endpoint(kind)
     return api_call(
         payload,
@@ -470,7 +484,106 @@ class RateLimitTracker:
 
 rate_limit_tracker = RateLimitTracker()
 
-def api_call(payload, max_retries=5, *, api_provider=None, api_url=None, api_key=None, api_key_source=None):
+
+# ── API Key 池 ──────────────────────────────────────────────────────
+
+class KeyPool:
+    """Thread-safe round-robin API key pool with per-key cooldown and disable."""
+
+    def __init__(self, entries):
+        self._entries = entries  # [(key, cluster, url), ...]
+        self._lock = threading.Lock()
+        self._index = 0
+        self._cooldowns = {}   # index -> monotonic time when cooldown expires
+        self._disabled = set() # indices permanently disabled this run
+
+    def __len__(self):
+        with self._lock:
+            return len(self._entries) - len(self._disabled)
+
+    @property
+    def total(self):
+        return len(self._entries)
+
+    def active_count(self):
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for i in range(len(self._entries))
+                       if i not in self._disabled and self._cooldowns.get(i, 0) <= now)
+
+    def next(self):
+        """Return (key, url, index) for the next available key, or None."""
+        if not self._entries:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            # Round-robin, skip disabled and cooling keys
+            for _ in range(len(self._entries)):
+                idx = self._index % len(self._entries)
+                self._index += 1
+                if idx in self._disabled:
+                    continue
+                if self._cooldowns.get(idx, 0) > now:
+                    continue
+                return self._entries[idx][0], self._entries[idx][2], idx
+            # All cooling — pick the one that cools soonest
+            best_idx, best_cd = None, float("inf")
+            for i in range(len(self._entries)):
+                if i in self._disabled:
+                    continue
+                cd = self._cooldowns.get(i, 0)
+                if cd < best_cd:
+                    best_cd, best_idx = cd, i
+            if best_idx is None:
+                return None
+            return self._entries[best_idx][0], self._entries[best_idx][2], best_idx
+
+    def mark_rate_limited(self, idx, cooldown=30):
+        with self._lock:
+            self._cooldowns[idx] = time.monotonic() + cooldown
+        masked = self._entries[idx][0][:8] + "..."
+        log(f"Key #{idx+1} ({masked}) 限流，冷却 {cooldown}s")
+
+    def mark_disabled(self, idx, reason=""):
+        with self._lock:
+            self._disabled.add(idx)
+        masked = self._entries[idx][0][:8] + "..."
+        log(f"Key #{idx+1} ({masked}) 已禁用: {reason}")
+
+    def is_single(self):
+        return len(self._entries) <= 1
+
+
+def _parse_key_pool():
+    """Parse MIMO_API_KEYS env var into a KeyPool.
+
+    Format: key1@cluster,key2@cluster,key3  (@ cluster is optional)
+    Falls back to single MIMO_API_KEY when MIMO_API_KEYS is not set.
+    """
+    raw = os.environ.get("MIMO_API_KEYS", "").strip()
+    if not raw:
+        return KeyPool([])
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "@" in part:
+            key, cluster = part.rsplit("@", 1)
+        else:
+            key = part
+            cluster = None
+        url = normalize_api_url(default_mimo_api_url(key, cluster=cluster))
+        entries.append((key, cluster, url))
+    if entries:
+        log(f"API key 池: {len(entries)} 个 key")
+    return KeyPool(entries)
+
+
+key_pool = _parse_key_pool()
+
+
+def api_call(payload, max_retries=5, *, api_provider=None, api_url=None, api_key=None, api_key_source=None, _pool_idx=None):
     """调用 OpenAI-compatible API，带重试。
 
     长视频理解会发出数百次 VLM/ASR 调用，集群的 429 限流是常态而非错误，所以重试更耐心
@@ -494,6 +607,16 @@ def api_call(payload, max_retries=5, *, api_provider=None, api_url=None, api_key
             body = e.read().decode("utf-8", errors="replace")[:500]
             wait = min(2 ** attempt, 60)
             if e.code == 429:
+                if _pool_idx is not None:
+                    key_pool.mark_rate_limited(_pool_idx)
+                    # 有池时换 key 立即重试，不等待
+                    pick = key_pool.next()
+                    if pick and pick[2] != _pool_idx:
+                        api_key, new_url, _pool_idx = pick
+                        endpoint = normalize_api_url(new_url)
+                        headers = _api_headers(api_provider=api_provider, api_url=endpoint, api_key=api_key)
+                        data = json.dumps(_prepare_api_payload(payload, api_provider=api_provider, api_url=endpoint)).encode("utf-8")
+                        continue
                 if not saw_429:
                     saw_429 = True
                     effective_max_retries = max(effective_max_retries, 7)
@@ -505,10 +628,20 @@ def api_call(payload, max_retries=5, *, api_provider=None, api_url=None, api_key
             elif e.code == 400:
                 log(f"API 请求错误 (400): {body[:200]}")
                 raise RuntimeError(f"API 请求错误 (400): {body}")
-            elif e.code == 401:
-                key_name = api_key_source or CONFIG.get("api_key_source", "MIMO_API_KEY")
-                raise RuntimeError(f"API 认证失败 (401)。请检查 {key_name} 和 API URL 是否匹配。")
-            elif e.code == 403:
+            elif e.code in (401, 403):
+                if _pool_idx is not None:
+                    reason = f"HTTP {e.code}" + (f": {body[:100]}" if body else "")
+                    key_pool.mark_disabled(_pool_idx, reason)
+                    pick = key_pool.next()
+                    if pick:
+                        api_key, new_url, _pool_idx = pick
+                        endpoint = normalize_api_url(new_url)
+                        headers = _api_headers(api_provider=api_provider, api_url=endpoint, api_key=api_key)
+                        data = json.dumps(_prepare_api_payload(payload, api_provider=api_provider, api_url=endpoint)).encode("utf-8")
+                        continue
+                if e.code == 401:
+                    key_name = api_key_source or CONFIG.get("api_key_source", "MIMO_API_KEY")
+                    raise RuntimeError(f"API 认证失败 (401)。请检查 {key_name} 和 API URL 是否匹配。")
                 hint = "API 访问被拒绝 (403)。"
                 if "1010" in body or "cloudflare" in body.lower():
                     hint += "IP 被 Cloudflare 限流，请等待几分钟后重试。"
